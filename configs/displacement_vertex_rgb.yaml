@@ -1,0 +1,32 @@
+# DDPM on trig displacement JPEGs (R,G,B = x,y,z encoding) + optional FEM steering loss.
+# Generate data: node scripts/generate-trig-surfaces.js --max N
+# Train: python -m iass_fem_diff.cli train-vertex-rgb configs/displacement_vertex_rgb.yaml
+
+experiment_name: displacement_vertex_rgb
+model_family: vertex_displacement_rgb
+
+data:
+  processed_dir: data/processed/displacement_rgb/trig
+  image_size: [80, 80]
+  # extent_from_meta: divide (byte/127.5-1) by per-channel extent_R from sidecar when present
+  normalization: extent_from_meta
+
+training:
+  seed: 42
+  batch_size: 4
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  checkpoint_dir: outputs/checkpoints/displacement_vertex_rgb
+
+diffusion:
+  num_train_timesteps: 1000
+
+# Differentiable proxy (viewer-consistent): pinned rows 0 and H−1, chord-relative sag on
+# vertical channel, bending ∂²w*/∂y². Added to the loss on predicted x0 so the model steers
+# toward lower curvature while noise MSE matches the trig data distribution.
+fem:
+  loss_weight: 0.05
+  # Row spacing for curvature; use plane/(H-1) from the viewer if displacements are in
+  # the same length units as that plane (default 1.0 = index-based penalty).
+  curvature_hy: 1.0
+  vertical_channel: 2

@@ -1,0 +1,26 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Data and heavy artifacts
+data/raw/
+data/processed/
+outputs/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated 3D viewer (regenerate with node scripts/view-trig-surface.js)
+scripts/trig-viewer.html

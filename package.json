@@ -1,0 +1,12 @@
+{
+  "name": "iass-fem-diff",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate-trig-surfaces": "node scripts/generate-trig-surfaces.js",
+    "view-trig-surface": "node scripts/view-trig-surface.js"
+  },
+  "dependencies": {
+    "jpeg-js": "^0.4.4"
+  }
+}

@@ -1,0 +1,23 @@
+# Separate checkpoint: learn distribution of FEM displacement maps (white→pink).
+# Conditioning: images read from data folder (paths relative to repo root).
+
+experiment_name: fem_displacement_map
+model_family: fem_field
+field: displacement_magnitude
+
+data:
+  input_images_dir: data/processed/fem_maps/inputs
+  target_images_dir: data/processed/fem_maps/displacement_maps
+  image_size: [512, 512]
+
+training:
+  seed: 42
+  batch_size: 4
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  checkpoint_dir: outputs/checkpoints/fem_displacement_map
+
+diffusion:
+  num_train_timesteps: 1000
+  # Set to unconditional, class-conditional, or image-conditioned when wired
+  conditioning: image
