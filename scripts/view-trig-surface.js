@@ -89,12 +89,21 @@ function buildViewerHtml() {
       <label>Disp scale <input type="number" id="dispScale" value="1" min="0" step="0.05" /></label>
     </div>
     <div class="row">
+      <label>Mesh subdiv <input type="number" id="meshSubdiv" value="2" min="1" max="8" step="1" /></label>
+      <label title="Box blur radius on sag before stress (reduces JPEG speckle)">Stress smooth <input type="number" id="stressSmooth" value="2" min="0" max="6" step="1" /></label>
+      <label title="Curvature uses neighbors ±span rows (wider sampling)">Stress span <input type="number" id="stressSpan" value="2" min="1" max="6" step="1" /></label>
+    </div>
+    <div class="row">
       <label><input type="checkbox" id="showBase" checked /> Show flat reference grid</label>
     </div>
+    <div class="row">
+      <label><input type="checkbox" id="animateMorph" /> Animate plane → UV displacement (loop)</label>
+      <label>Cycle (s) <input type="number" id="morphPeriod" value="5" min="1" max="60" step="0.5" /></label>
+    </div>
     <div class="row" style="margin-top:12px;flex-direction:column;align-items:flex-start;gap:6px">
-      <span style="font-size:12px;color:#a8a8b0">FEM-style colors (see <code>viz/colormaps.py</code>). Model: <strong>row 0 &amp; row H−1</strong> = pinned anchors (orange), <strong>uniform gravity</strong> (−Z) on all nodes; deflection is sag relative to the chord between anchors; stress proxy ≈ ∂²w/∂y² on that sag.</span>
-      <label><input type="checkbox" id="femDispColors" /> Deflection · white→pink from |sag| (chord between anchor rows)</label>
-      <label><input type="checkbox" id="femStressColors" /> Stress · blue←white→red from bending (∂²w/∂y²) or sidecar <code>extra.fem_stress_*</code></label>
+      <span style="font-size:12px;color:#a8a8b0">FEM-style colors (see <code>viz/colormaps.py</code>). Model: <strong>four edges</strong> pinned (row/column 0 and last — orange), <strong>uniform gravity</strong> (−Z); deflection is sag vs a Coons boundary surface; stress proxy ≈ Laplacian (sum of ∂²w/∂u² and ∂²w/∂v² on that sag).</span>
+      <label><input type="checkbox" id="femDispColors" /> Deflection · white→pink from |sag| (four-edge reference)</label>
+      <label><input type="checkbox" id="femStressColors" /> Stress · blue←white→red from Laplacian bending or sidecar <code>extra.fem_stress_*</code></label>
       <span style="font-size:11px;color:#888;line-height:1.35">Sidecar stress overrides the bending proxy when present. If both FEM boxes are on, stress colormap wins.</span>
     </div>
     <button type="button" id="btnLoad">Build / refresh mesh</button>
@@ -120,6 +129,11 @@ const dispScaleEl = document.getElementById('dispScale');
 const showBaseEl = document.getElementById('showBase');
 const femDispColorsEl = document.getElementById('femDispColors');
 const femStressColorsEl = document.getElementById('femStressColors');
+const meshSubdivEl = document.getElementById('meshSubdiv');
+const stressSmoothEl = document.getElementById('stressSmooth');
+const stressSpanEl = document.getElementById('stressSpan');
+const animateMorphEl = document.getElementById('animateMorph');
+const morphPeriodEl = document.getElementById('morphPeriod');
 const btnLoad = document.getElementById('btnLoad');
 const statusEl = document.getElementById('status');
 
@@ -222,46 +236,193 @@ function parseStressFlat(meta, W, H) {
 }
 
 /**
- * Vertical position z per node (row-major). Subtract straight chord along each column
- * between row 0 and row H−1 so pinned anchor rows are the reference (w* = 0 on edges).
+ * Sag vs Coons bilinear boundary blend: w* = 0 on first/last row and first/last column.
  */
 function chordRelativeSagZ(zz, W, H) {
   const n = W * H;
   const wStar = new Float32Array(n);
-  if (H < 2) return wStar;
-  const inv = 1 / (H - 1);
-  for (let i = 0; i < W; i++) {
-    const z0 = zz[i];
-    const z1 = zz[(H - 1) * W + i];
-    for (let j = 0; j < H; j++) {
+  if (W < 2 || H < 2) return wStar;
+  const invU = 1 / (W - 1);
+  const invV = 1 / (H - 1);
+  const z00 = zz[0];
+  const zW0 = zz[W - 1];
+  const z0H = zz[(H - 1) * W];
+  const zWH = zz[(H - 1) * W + (W - 1)];
+  for (let j = 0; j < H; j++) {
+    const v = j * invV;
+    const omv = 1 - v;
+    for (let i = 0; i < W; i++) {
+      const u = i * invU;
+      const omu = 1 - u;
       const k = j * W + i;
-      const alpha = j * inv;
-      wStar[k] = zz[k] - (1 - alpha) * z0 - alpha * z1;
+      const bottomZ = zz[i];
+      const topZ = zz[(H - 1) * W + i];
+      const leftZ = zz[j * W + 0];
+      const rightZ = zz[j * W + (W - 1)];
+      const surf =
+        omv * bottomZ +
+        v * topZ +
+        omu * leftZ +
+        u * rightZ -
+        omu * omv * z00 -
+        u * omv * zW0 -
+        omu * v * z0H -
+        u * v * zWH;
+      wStar[k] = zz[k] - surf;
     }
   }
   return wStar;
 }
 
 /**
- * Uniform-gravity bending proxy: d²(w*) / dy² in world units (y = row direction, spacing plane/(H−1)).
- * Anchor rows and dangling rows set to 0.
+ * Separable box blur (edge clamped). Reduces high-frequency JPEG noise before curvature.
  */
-function bendingCurvatureY(wStar, W, H, plane) {
+function boxBlurGrid2D(src, W, H, radius) {
   const n = W * H;
+  if (radius <= 0) return new Float32Array(src);
+  const tmp = new Float32Array(n);
   const out = new Float32Array(n);
-  if (H < 3) return out;
-  const hy = plane / (H - 1);
-  const hy2 = hy * hy;
-  if (hy2 < 1e-24) return out;
-  for (let j = 1; j < H - 1; j++) {
+  for (let j = 0; j < H; j++) {
     for (let i = 0; i < W; i++) {
-      const k = j * W + i;
-      const km = (j - 1) * W + i;
-      const kp = (j + 1) * W + i;
-      out[k] = (wStar[kp] - 2 * wStar[k] + wStar[km]) / hy2;
+      let s = 0;
+      let c = 0;
+      for (let di = -radius; di <= radius; di++) {
+        const ii = Math.max(0, Math.min(W - 1, i + di));
+        s += src[j * W + ii];
+        c++;
+      }
+      tmp[j * W + i] = s / c;
+    }
+  }
+  for (let j = 0; j < H; j++) {
+    for (let i = 0; i < W; i++) {
+      let s = 0;
+      let c = 0;
+      for (let dj = -radius; dj <= radius; dj++) {
+        const jj = Math.max(0, Math.min(H - 1, j + dj));
+        s += tmp[jj * W + i];
+        c++;
+      }
+      out[j * W + i] = s / c;
     }
   }
   return out;
+}
+
+/**
+ * Laplacian proxy: (∂²/∂u² + ∂²/∂v²) w* with central stencils, neighbors ±span apart in
+ * column (u) and row (v). hx = plane/(W−1), hy = plane/(H−1).
+ */
+function bendingLaplacian(wStar, W, H, plane, span) {
+  const n = W * H;
+  const out = new Float32Array(n);
+  const sp = Math.max(1, Math.floor(span));
+  if (W < 2 * sp + 1 || H < 2 * sp + 1) return out;
+  const hx = plane / (W - 1);
+  const hy = plane / (H - 1);
+  const hx2 = sp * sp * hx * hx;
+  const hy2 = sp * sp * hy * hy;
+  if (hx2 < 1e-24 || hy2 < 1e-24) return out;
+  for (let j = sp; j < H - sp; j++) {
+    for (let i = sp; i < W - sp; i++) {
+      const k = j * W + i;
+      const kxm = j * W + (i - sp);
+      const kxp = j * W + (i + sp);
+      const kym = (j - sp) * W + i;
+      const kyp = (j + sp) * W + i;
+      const d2x = (wStar[kxp] - 2 * wStar[k] + wStar[kxm]) / hx2;
+      const d2y = (wStar[kyp] - 2 * wStar[k] + wStar[kym]) / hy2;
+      out[k] = d2x + d2y;
+    }
+  }
+  return out;
+}
+
+/** Bilinear upsample scalar grid (row-major) from W×H to Wf×Hf. */
+function upsampleBilinearScalar(src, W, H, Wf, Hf) {
+  const out = new Float32Array(Wf * Hf);
+  for (let jf = 0; jf < Hf; jf++) {
+    const v = Hf === 1 ? 0 : jf / (Hf - 1);
+    const gc = v * (H - 1);
+    const j0 = Math.min(H - 2, Math.max(0, Math.floor(gc)));
+    const j1 = j0 + 1;
+    const tj = gc - j0;
+    for (let ix = 0; ix < Wf; ix++) {
+      const u = Wf === 1 ? 0 : ix / (Wf - 1);
+      const fc = u * (W - 1);
+      const i0 = Math.min(W - 2, Math.max(0, Math.floor(fc)));
+      const i1 = i0 + 1;
+      const ti = fc - i0;
+      const v00 = src[j0 * W + i0];
+      const v10 = src[j0 * W + i1];
+      const v01 = src[j1 * W + i0];
+      const v11 = src[j1 * W + i1];
+      const v0 = v00 * (1 - ti) + v10 * ti;
+      const v1 = v01 * (1 - ti) + v11 * ti;
+      out[jf * Wf + ix] = v0 * (1 - tj) + v1 * tj;
+    }
+  }
+  return out;
+}
+
+function upsamplePositions(posCoarse, W, H, Wf, Hf) {
+  const nC = W * H;
+  const xc = new Float32Array(nC);
+  const yc = new Float32Array(nC);
+  const zc = new Float32Array(nC);
+  for (let k = 0; k < nC; k++) {
+    xc[k] = posCoarse[k * 3];
+    yc[k] = posCoarse[k * 3 + 1];
+    zc[k] = posCoarse[k * 3 + 2];
+  }
+  const xf = upsampleBilinearScalar(xc, W, H, Wf, Hf);
+  const yf = upsampleBilinearScalar(yc, W, H, Wf, Hf);
+  const zf = upsampleBilinearScalar(zc, W, H, Wf, Hf);
+  const nf = Wf * Hf;
+  const out = new Float32Array(nf * 3);
+  for (let k = 0; k < nf; k++) {
+    out[k * 3] = xf[k];
+    out[k * 3 + 1] = yf[k];
+    out[k * 3 + 2] = zf[k];
+  }
+  return out;
+}
+
+function upsampleColors(colCoarse, W, H, Wf, Hf) {
+  const nC = W * H;
+  const rc = new Float32Array(nC);
+  const gc = new Float32Array(nC);
+  const bc = new Float32Array(nC);
+  for (let k = 0; k < nC; k++) {
+    rc[k] = colCoarse[k * 3];
+    gc[k] = colCoarse[k * 3 + 1];
+    bc[k] = colCoarse[k * 3 + 2];
+  }
+  const rf = upsampleBilinearScalar(rc, W, H, Wf, Hf);
+  const gf = upsampleBilinearScalar(gc, W, H, Wf, Hf);
+  const bf = upsampleBilinearScalar(bc, W, H, Wf, Hf);
+  const nf = Wf * Hf;
+  const out = new Float32Array(nf * 3);
+  for (let k = 0; k < nf; k++) {
+    out[k * 3] = rf[k];
+    out[k * 3 + 1] = gf[k];
+    out[k * 3 + 2] = bf[k];
+  }
+  return out;
+}
+
+function buildQuadIndices(W, H) {
+  const indices = [];
+  for (let j2 = 0; j2 < H - 1; j2++) {
+    for (let i2 = 0; i2 < W - 1; i2++) {
+      const a = j2 * W + i2;
+      const b1 = j2 * W + i2 + 1;
+      const c = (j2 + 1) * W + i2 + 1;
+      const d = (j2 + 1) * W + i2;
+      indices.push(a, b1, d, b1, c, d);
+    }
+  }
+  return indices;
 }
 
 function stemFromImageFileName(name) {
@@ -342,7 +503,10 @@ function buildBuffers(
   dispScale,
   showBase,
   femDeflectionColors,
-  femStressColors
+  femStressColors,
+  subdiv,
+  stressBlurR,
+  stressSpan
 ) {
   const ch = getChannels(meta);
   const Tr = ch ? null : maxAbsT(rgba, W, H, 0);
@@ -351,8 +515,11 @@ function buildBuffers(
 
   const n = W * H;
   const stressFlat = parseStressFlat(meta, W, H);
+  const sub = Math.max(1, Math.min(8, Math.floor(subdiv)));
+  const blurR = Math.max(0, Math.min(6, Math.floor(stressBlurR)));
+  const span = Math.max(1, Math.min(6, Math.floor(stressSpan)));
 
-  const positions = new Float32Array(n * 3);
+  const posCoarse = new Float32Array(n * 3);
 
   for (let j = 0; j < H; j++) {
     for (let i = 0; i < W; i++) {
@@ -371,25 +538,29 @@ function buildBuffers(
       const bx = (u - 0.5) * plane;
       const by = (v - 0.5) * plane;
 
-      positions[k * 3] = bx + dispScale * dx;
-      positions[k * 3 + 1] = by + dispScale * dy;
-      positions[k * 3 + 2] = dispScale * dz;
+      posCoarse[k * 3] = bx + dispScale * dx;
+      posCoarse[k * 3 + 1] = by + dispScale * dy;
+      posCoarse[k * 3 + 2] = dispScale * dz;
     }
   }
 
   let wStar = null;
-  if (
-    femDeflectionColors ||
-    (femStressColors && !stressFlat)
-  ) {
+  if (femDeflectionColors || (femStressColors && !stressFlat)) {
     const zz = new Float32Array(n);
-    for (let ii = 0; ii < n; ii++) zz[ii] = positions[ii * 3 + 2];
+    for (let ii = 0; ii < n; ii++) zz[ii] = posCoarse[ii * 3 + 2];
     wStar = chordRelativeSagZ(zz, W, H);
   }
 
-  let stressSamples = stressFlat;
-  if (femStressColors && !stressSamples && wStar) {
-    stressSamples = bendingCurvatureY(wStar, W, H, plane);
+  let stressSamples = null;
+  if (femStressColors && stressFlat) {
+    stressSamples = new Float32Array(stressFlat);
+    if (blurR > 0) {
+      stressSamples = boxBlurGrid2D(stressSamples, W, H, blurR);
+    }
+  } else if (femStressColors && wStar) {
+    let ws = wStar;
+    if (blurR > 0) ws = boxBlurGrid2D(ws, W, H, blurR);
+    stressSamples = bendingLaplacian(ws, W, H, plane, span);
   }
 
   let stressLim =
@@ -423,7 +594,7 @@ function buildBuffers(
     }
   }
 
-  const colors = new Float32Array(n * 3);
+  const colorsCoarse = new Float32Array(n * 3);
   for (let j = 0; j < H; j++) {
     for (let i = 0; i < W; i++) {
       const k = j * W + i;
@@ -453,41 +624,54 @@ function buildBuffers(
         cb = rgb[2];
       }
 
-      colors[k * 3] = cr;
-      colors[k * 3 + 1] = cg;
-      colors[k * 3 + 2] = cb;
+      colorsCoarse[k * 3] = cr;
+      colorsCoarse[k * 3 + 1] = cg;
+      colorsCoarse[k * 3 + 2] = cb;
     }
   }
 
-  const indices = [];
-  for (let j2 = 0; j2 < H - 1; j2++) {
-    for (let i2 = 0; i2 < W - 1; i2++) {
-      const a = j2 * W + i2;
-      const b1 = j2 * W + i2 + 1;
-      const c = (j2 + 1) * W + i2 + 1;
-      const d = (j2 + 1) * W + i2;
-      indices.push(a, b1, d, b1, c, d);
-    }
+  const Wf = sub <= 1 ? W : (W - 1) * sub + 1;
+  const Hf = sub <= 1 ? H : (H - 1) * sub + 1;
+  const nf = Wf * Hf;
+
+  let positions;
+  let colors;
+  let basePositions;
+
+  if (sub <= 1) {
+    positions = posCoarse;
+    colors = colorsCoarse;
+  } else {
+    positions = upsamplePositions(posCoarse, W, H, Wf, Hf);
+    colors = upsampleColors(colorsCoarse, W, H, Wf, Hf);
   }
 
-  let basePositions = null;
-  if (showBase) {
-    basePositions = new Float32Array(n * 3);
-    for (let j3 = 0; j3 < H; j3++) {
-      for (let i3 = 0; i3 < W; i3++) {
-        const k3 = j3 * W + i3;
-        const u3 = i3 / (W - 1);
-        const v3 = j3 / (H - 1);
-        basePositions[k3 * 3] = (u3 - 0.5) * plane;
-        basePositions[k3 * 3 + 1] = (v3 - 0.5) * plane;
-        basePositions[k3 * 3 + 2] = 0;
-      }
+  const indices = buildQuadIndices(Wf, Hf);
+
+  const baseCoarse = new Float32Array(n * 3);
+  for (let j3 = 0; j3 < H; j3++) {
+    for (let i3 = 0; i3 < W; i3++) {
+      const k3 = j3 * W + i3;
+      const u3 = i3 / (W - 1);
+      const v3 = j3 / (H - 1);
+      baseCoarse[k3 * 3] = (u3 - 0.5) * plane;
+      baseCoarse[k3 * 3 + 1] = (v3 - 0.5) * plane;
+      baseCoarse[k3 * 3 + 2] = 0;
     }
   }
+  basePositions =
+    sub <= 1 ? baseCoarse : upsamplePositions(baseCoarse, W, H, Wf, Hf);
 
   const indexTyped =
-    n < 65536 ? new Uint16Array(indices) : new Uint32Array(indices);
-  return { positions, colors, indices: indexTyped, basePositions };
+    nf < 65536 ? new Uint16Array(indices) : new Uint32Array(indices);
+  return {
+    positions,
+    colors,
+    indices: indexTyped,
+    basePositions,
+    gridW: Wf,
+    gridH: Hf,
+  };
 }
 
 const scene = new THREE.Scene();
@@ -496,6 +680,12 @@ scene.background = new THREE.Color(0x1a1a1e);
 let mesh = null;
 let wire = null;
 let anchorGroup = null;
+/** Flat plane vs deformed positions (same length) for morph animation */
+let morphFlat = null;
+let morphDef = null;
+let morphGridW = 0;
+let morphGridH = 0;
+let morphStartTime = 0;
 
 function disposeAnchorLines() {
   if (!anchorGroup) return;
@@ -507,7 +697,7 @@ function disposeAnchorLines() {
   anchorGroup = null;
 }
 
-/** Pinned supports: polylines along row 0 and row H−1 on the deformed mesh. */
+/** Pinned supports: all four boundary polylines (u and v min/max) on the deformed mesh. */
 function makeAnchorSupportLines(positions, W, H) {
   const g = new THREE.Group();
   const rowLine = (jRow) => {
@@ -525,8 +715,25 @@ function makeAnchorSupportLines(positions, W, H) {
       new THREE.LineBasicMaterial({ color: 0xff9933 })
     );
   };
+  const colLine = (iCol) => {
+    const verts = new Float32Array(H * 3);
+    for (let j = 0; j < H; j++) {
+      const k = j * W + iCol;
+      verts[j * 3] = positions[k * 3];
+      verts[j * 3 + 1] = positions[k * 3 + 1];
+      verts[j * 3 + 2] = positions[k * 3 + 2];
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    return new THREE.Line(
+      geo,
+      new THREE.LineBasicMaterial({ color: 0xff9933 })
+    );
+  };
   g.add(rowLine(0));
   g.add(rowLine(H - 1));
+  g.add(colLine(0));
+  g.add(colLine(W - 1));
   return g;
 }
 
@@ -577,6 +784,51 @@ function fitCamera(geo) {
   controls.update();
 }
 
+function applyMorphToMesh(t) {
+  if (!mesh) return;
+  const attr = mesh.geometry.getAttribute('position');
+  if (!attr || !morphFlat || !morphDef) return;
+  const arr = attr.array;
+  const len = morphFlat.length;
+  const u = Math.max(0, Math.min(1, t));
+  for (let i = 0; i < len; i++) {
+    arr[i] = morphFlat[i] + u * (morphDef[i] - morphFlat[i]);
+  }
+  attr.needsUpdate = true;
+  mesh.geometry.computeVertexNormals();
+}
+
+function updateAnchorLinesLerped(group, flat, def, W, H, t) {
+  if (!group || group.children.length < 4 || !flat || !def) return;
+  const u = Math.max(0, Math.min(1, t));
+  const updRow = (child, j) => {
+    const pos = child.geometry.getAttribute('position');
+    const a = pos.array;
+    for (let i = 0; i < W; i++) {
+      const k = j * W + i;
+      a[i * 3] = flat[k * 3] + u * (def[k * 3] - flat[k * 3]);
+      a[i * 3 + 1] = flat[k * 3 + 1] + u * (def[k * 3 + 1] - flat[k * 3 + 1]);
+      a[i * 3 + 2] = flat[k * 3 + 2] + u * (def[k * 3 + 2] - flat[k * 3 + 2]);
+    }
+    pos.needsUpdate = true;
+  };
+  updRow(group.children[0], 0);
+  updRow(group.children[1], H - 1);
+  const updCol = (child, iCol) => {
+    const pos = child.geometry.getAttribute('position');
+    const a = pos.array;
+    for (let j = 0; j < H; j++) {
+      const k = j * W + iCol;
+      a[j * 3] = flat[k * 3] + u * (def[k * 3] - flat[k * 3]);
+      a[j * 3 + 1] = flat[k * 3 + 1] + u * (def[k * 3 + 1] - flat[k * 3 + 1]);
+      a[j * 3 + 2] = flat[k * 3 + 2] + u * (def[k * 3 + 2] - flat[k * 3 + 2]);
+    }
+    pos.needsUpdate = true;
+  };
+  updCol(group.children[2], 0);
+  updCol(group.children[3], W - 1);
+}
+
 function rebuildFromRgba(rgba, W, H, meta, metaHint) {
   if (W < 2 || H < 2) {
     setStatus('Image must be at least 2×2 pixels.');
@@ -594,6 +846,12 @@ function rebuildFromRgba(rgba, W, H, meta, metaHint) {
   const showBase = showBaseEl.checked;
   const femDeflectionColors = femDispColorsEl.checked;
   const femStressColors = femStressColorsEl.checked;
+  let meshSubdiv = parseInt(meshSubdivEl.value, 10);
+  if (!Number.isFinite(meshSubdiv) || meshSubdiv < 1) meshSubdiv = 1;
+  let stressSmooth = parseInt(stressSmoothEl.value, 10);
+  if (!Number.isFinite(stressSmooth) || stressSmooth < 0) stressSmooth = 0;
+  let stressSpanVal = parseInt(stressSpanEl.value, 10);
+  if (!Number.isFinite(stressSpanVal) || stressSpanVal < 1) stressSpanVal = 1;
 
   const ch = getChannels(meta);
   if (meta && meta.extra && meta.extra.grid) {
@@ -623,7 +881,10 @@ function rebuildFromRgba(rgba, W, H, meta, metaHint) {
     dispScale,
     showBase,
     femDeflectionColors,
-    femStressColors
+    femStressColors,
+    meshSubdiv,
+    stressSmooth,
+    stressSpanVal
   );
 
   disposeMesh(mesh);
@@ -672,11 +933,34 @@ function rebuildFromRgba(rgba, W, H, meta, metaHint) {
   }
 
   if (femDeflectionColors || femStressColors) {
-    anchorGroup = makeAnchorSupportLines(buf.positions, W, H);
+    anchorGroup = makeAnchorSupportLines(
+      buf.positions,
+      buf.gridW,
+      buf.gridH
+    );
     scene.add(anchorGroup);
   }
 
   fitCamera(geo);
+
+  morphFlat = buf.basePositions ? new Float32Array(buf.basePositions) : null;
+  morphDef = new Float32Array(buf.positions);
+  morphGridW = buf.gridW;
+  morphGridH = buf.gridH;
+  morphStartTime = performance.now();
+  if (animateMorphEl.checked && morphFlat) {
+    applyMorphToMesh(0);
+    if (anchorGroup) {
+      updateAnchorLinesLerped(
+        anchorGroup,
+        morphFlat,
+        morphDef,
+        morphGridW,
+        morphGridH,
+        0
+      );
+    }
+  }
 
   const mode = ch ? 'metadata decode' : 'auto scale (per-channel mid-gray)';
   const stressFieldArr = parseStressFlat(meta, W, H);
@@ -685,17 +969,23 @@ function rebuildFromRgba(rgba, W, H, meta, metaHint) {
   if (femStressColors) {
     colorMode = hasStressField
       ? 'vertex colors: FEM stress (sidecar field)'
-      : 'vertex colors: FEM stress (∂²w/∂y² proxy, uniform −Z)';
+      : 'vertex colors: FEM stress (Laplacian proxy, uniform −Z)';
   } else if (femDeflectionColors) {
     colorMode =
-      'vertex colors: FEM |sag| white→pink (chord from anchor rows)';
+      'vertex colors: FEM |sag| white→pink (four-edge Coons ref)';
   }
   let msg =
     'Mesh: ' +
     W +
     '×' +
     H +
-    ' · ' +
+    ' → ' +
+    buf.gridW +
+    '×' +
+    buf.gridH +
+    ' (subdiv ' +
+    meshSubdiv +
+    ') · ' +
     mode +
     ' · ' +
     colorMode +
@@ -703,10 +993,20 @@ function rebuildFromRgba(rgba, W, H, meta, metaHint) {
     plane +
     ' dispScale=' +
     dispScale;
+  if (femStressColors && !hasStressField) {
+    msg +=
+      ' · stress smooth=' +
+      stressSmooth +
+      ' span=' +
+      stressSpanVal;
+  }
   if (femStressColors && femDeflectionColors) {
     msg += '\\nBoth FEM toggles on — stress colormap is shown.';
   }
   if (metaHint) msg += '\\n' + metaHint;
+  if (animateMorphEl.checked) {
+    msg += '\\nMorph: plane ↔ displacement (loop, ' + (parseFloat(morphPeriodEl.value) || 5) + 's).';
+  }
   setStatus(msg);
 }
 
@@ -794,6 +1094,39 @@ function rebuildFromCache() {
 
 femDispColorsEl.addEventListener('change', rebuildFromCache);
 femStressColorsEl.addEventListener('change', rebuildFromCache);
+meshSubdivEl.addEventListener('change', rebuildFromCache);
+stressSmoothEl.addEventListener('change', rebuildFromCache);
+stressSpanEl.addEventListener('change', rebuildFromCache);
+
+animateMorphEl.addEventListener('change', () => {
+  if (!mesh || !morphFlat || !morphDef) return;
+  if (animateMorphEl.checked) {
+    morphStartTime = performance.now();
+    applyMorphToMesh(0);
+    if (anchorGroup && morphGridW > 0) {
+      updateAnchorLinesLerped(
+        anchorGroup,
+        morphFlat,
+        morphDef,
+        morphGridW,
+        morphGridH,
+        0
+      );
+    }
+  } else {
+    applyMorphToMesh(1);
+    if (anchorGroup && morphGridW > 0) {
+      updateAnchorLinesLerped(
+        anchorGroup,
+        morphFlat,
+        morphDef,
+        morphGridW,
+        morphGridH,
+        1
+      );
+    }
+  }
+});
 
 btnLoad.addEventListener('click', () => {
   loadImageAndMeta().catch((e) => {
@@ -811,6 +1144,23 @@ window.addEventListener('resize', () => {
 function tick() {
   requestAnimationFrame(tick);
   controls.update();
+  if (mesh && morphFlat && morphDef && animateMorphEl.checked) {
+    const periodSec = Math.max(0.5, parseFloat(morphPeriodEl.value) || 5);
+    const period = periodSec * 1000;
+    const phase = ((performance.now() - morphStartTime) % period) / period;
+    const t = 0.5 - 0.5 * Math.cos(phase * 2 * Math.PI);
+    applyMorphToMesh(t);
+    if (anchorGroup && morphGridW > 0) {
+      updateAnchorLinesLerped(
+        anchorGroup,
+        morphFlat,
+        morphDef,
+        morphGridW,
+        morphGridH,
+        t
+      );
+    }
+  }
   renderer.render(scene, camera);
 }
 tick();

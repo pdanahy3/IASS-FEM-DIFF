@@ -13,7 +13,7 @@ This repository is set up for **training only**: producing weights/checkpoints y
 - **Idea:** Each training sample is a raster image whose **R, G, B** channels encode **X, Y, Z** vertex displacement (after a fixed normalization), for meshes that share the same **u,v** topology as your training corpus.
 - **Unstructured data:** Meshes are not on a regular grid; you **rasterize** (or otherwise map) per-vertex displacements onto a 2D image (e.g. canonical UV layout, or a consistent orthographic view) so a 2D diffusion model can operate on fixed-resolution tensors.
 - **Unsupervised training:** Learn the distribution of these RGB displacement images (e.g. DDPM / latent diffusion) **without** paired “target” labels beyond the samples themselves.
-- **Trig surfaces + FEM steering:** Synthetic trig JPEGs from `scripts/generate-trig-surfaces.js` can train a DDPM via `train-vertex-rgb`. The loss is **noise prediction MSE** (standard diffusion) plus **`fem.loss_weight` × structural proxy** on the predicted clean image: chord-relative sag between **pinned rows 0 and H−1** and mean **(∂²w*/∂y²)²** on that sag (same idealization as `scripts/view-trig-surface.js`). That biases the sampler toward **lower bending** while still matching the data distribution. Tune `fem.loss_weight` and `fem.curvature_hy` in `configs/displacement_vertex_rgb.yaml`.
+- **Trig surfaces + FEM steering:** Synthetic trig JPEGs from `scripts/generate-trig-surfaces.js` can train a DDPM via `train-vertex-rgb`. The loss is **noise prediction MSE** plus **`fem.loss_weight` × structural proxy** on the predicted clean image: **four-edge** pinned reference (Coons sag (w*)) and mean **Laplacian (Δw*)²**, matching `scripts/view-trig-surface.js`. Tune `fem.loss_weight`, `fem.plane_size`, and `fem.curvature_span` in `configs/displacement_vertex_rgb.yaml`.
 
 ### 2. FEM-informed maps (two checkpoints)
 
@@ -42,14 +42,14 @@ src/iass_fem_diff/
   cli.py          # Typer entrypoint
   datasets/       # Trig RGB dataset + FEM map stubs
   io/metadata.py # Metadata schema + read/write
-  physics/        # Differentiable FEM proxy (bending on chord-relative sag)
+  physics/        # Differentiable FEM proxy (four-edge sag, Laplacian)
   train/          # DDPM on trig RGB (`trig_diffusion.py`)
   viz/colormaps.py # FEM visualization conventions
 ```
 
 ## Quick start (after you add dependencies)
 
-The library lives under `src/`. You must either **install it in editable mode** (recommended) or set `PYTHONPATH=src` before running modules.
+On **Windows 11**, use **PowerShell** (or Command Prompt) from the repo root. The library lives under `src/`. You must either **install it in editable mode** (recommended) or set `PYTHONPATH=src` before running modules.
 
 ```powershell
 cd IASS-FEM-DIFF
@@ -66,10 +66,26 @@ Use the **same** `python` / `pip` pair (e.g. if you use `C:\Python314\python.exe
 
 Train on trig JPEGs:
 
-```bash
+```powershell
 node scripts/generate-trig-surfaces.js --max 2000
 python -m iass_fem_diff.cli train-vertex-rgb configs/displacement_vertex_rgb.yaml
 ```
+
+**GPU (Windows 11 + NVIDIA):** The training loop uses `.to(device)` with `device: cuda` in `configs/displacement_vertex_rgb.yaml` (or `auto` to pick CUDA when available).
+
+If `torch.cuda.is_available()` is **False** even though `nvidia-smi` works, your PyTorch build is almost certainly **CPU-only**. Check the version string: `2.11.0+cpu` means no CUDA in that install (bundled CUDA in PyTorch is separate from the NVIDIA driver). Replace it with a CUDA wheel, e.g.:
+
+```powershell
+python -m pip install torch torchvision --upgrade --index-url https://download.pytorch.org/whl/cu128
+```
+
+Use the **same** `python` you use for training (`where python` — Windows may list several). After installing, you should see `+cu128` (or similar), not `+cpu`:
+
+```text
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+You want `torch.cuda.is_available()` → `True` and a non-empty `torch.version.cuda`. See [pytorch.org/get-started](https://pytorch.org/get-started/locally/) if you need a different CUDA flavor.
 
 Other training commands (`train-fem-field`) remain stubs until you wire paired FEM map data.
 

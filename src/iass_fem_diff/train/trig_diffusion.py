@@ -1,6 +1,6 @@
 """
 DDPM training on trig displacement RGB with an auxiliary FEM proxy loss on the predicted
-clean image x0: steers samples toward lower bending (chord-relative sag curvature) while
+clean image x0: steers samples toward lower bending (four-edge sag, Laplacian proxy) while
 the primary MSE on noise keeps the distribution aligned with training rasters.
 """
 
@@ -62,11 +62,37 @@ def train_from_config(config_path: Path) -> None:
 
     num_steps = int(diff_cfg.get("num_train_timesteps", 1000))
     fem_weight = float(fem_cfg.get("loss_weight", 0.05))
-    hy = float(fem_cfg.get("curvature_hy", 1.0))
+    plane = float(fem_cfg.get("plane_size", 2.0))
+    fem_span = int(fem_cfg.get("curvature_span", 1))
     vert_ch = int(fem_cfg.get("vertical_channel", 2))
 
     torch.manual_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    dev_pref = str(train_cfg.get("device", "auto")).strip().lower()
+    if dev_pref == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "training.device is 'cuda' but PyTorch was built without CUDA or no GPU driver. "
+                "Verify: python -c \"import torch; print(torch.cuda.is_available())\". "
+                "Install a CUDA wheel from https://pytorch.org/get-started/locally/ "
+                "(pip --index-url https://download.pytorch.org/whl/cu124 or newer cu* for your stack)."
+            )
+        device = torch.device("cuda")
+    elif dev_pref == "cpu":
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        _name = torch.cuda.get_device_name(0)
+        _cc = torch.version.cuda or "?"
+        print(f"Training on GPU: {_name} (torch CUDA {_cc})")
+    else:
+        print(
+            "Training on CPU — install a CUDA-enabled PyTorch build to use your RTX GPU. "
+            "See https://pytorch.org/get-started/locally/"
+        )
 
     ds = VertexDisplacementRGBDataset(disp_cfg)
     if len(ds) == 0:
@@ -84,7 +110,10 @@ def train_from_config(config_path: Path) -> None:
         drop_last=False,
     )
 
-    h, w = disp_cfg.image_size[1], disp_cfg.image_size[0]
+    iw, ih = disp_cfg.image_size[0], disp_cfg.image_size[1]
+    hx = plane / max(iw - 1, 1)
+    hy = plane / max(ih - 1, 1)
+    h, w = ih, iw
     model = UNet2DModel(
         sample_size=h,
         in_channels=3,
@@ -139,7 +168,11 @@ def train_from_config(config_path: Path) -> None:
                 x0_hat = x0_hat.clamp(-1.0, 1.0)
                 disp = x0_hat * extent.view(b, 3, 1, 1)
                 loss_fem = structural_efficiency_loss(
-                    disp, vertical_channel=vert_ch, hy=hy
+                    disp,
+                    vertical_channel=vert_ch,
+                    hx=hx,
+                    hy=hy,
+                    span=fem_span,
                 )
 
             loss = loss_noise + fem_weight * loss_fem
@@ -170,7 +203,10 @@ def train_from_config(config_path: Path) -> None:
                 "config": str(config_path),
                 "num_train_timesteps": num_steps,
                 "fem_loss_weight": fem_weight,
+                "plane_size": plane,
+                "curvature_hx": hx,
                 "curvature_hy": hy,
+                "curvature_span": fem_span,
             },
             ckpt_path,
         )
