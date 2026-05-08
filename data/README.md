@@ -26,6 +26,8 @@ node scripts/generate-trig-surfaces.js --max 500
 
 The generator enumerates **225** u,v domains (every span `[min,max]` on each axis with 90° knots 0…360 and min≤max), multiplied by 10³ formula triples and coefficient triples (default **0.2–6**, step **0.2** → 30 values per axis → **225 × 27,000,000** full combinations). **`--max N`** samples **N** surfaces uniformly across that full space. Use `--max 0 --force` for a full run. Filenames include `d###` (domain index) and `u…_v…` bounds.
 
+**Displacement in JPEGs:** each of R, G, B encodes **x, y, z** displacement with the same fixed linear map: physical **−15…+15** → byte **0…255** (`extra.rgb_mapping.encoding: "fixed_linear"`). Training uses `data.normalization: fixed_linear` so tensors match this decode. Regenerate JPEGs after changing the script; old zero-mid encodings need `extent_from_meta` + the previous viewer decode path.
+
 **3D viewer:** `node scripts/view-trig-surface.js` writes `scripts/trig-viewer.html`. **HTTP:** serve repo root (`npx --yes serve . -p 8765`), open `/scripts/trig-viewer.html`, pick the JPEG — sidecar JSON is **fetched** from `data/processed/.../trig/`. **file://:** browsers block that fetch — in one dialog **Ctrl+select** `stem.jpg` and `stem.meta.json`, or use HTTP.
 
 ## Metadata sidecar (JSON)
@@ -34,6 +36,6 @@ Each raster export should ship with a `.meta.json` (or embedded in a manifest) u
 
 Document here for your project:
 
-- Displacement normalization (global max per dataset vs per sample).
+- Displacement normalization (trig: fixed **−15…15** → RGB bytes; see `rgb_mapping` in sidecars).
 - Stress definition (von Mises vs principal vs shell membrane/bending).
 - u,v orientation and seam placement for rasterization.

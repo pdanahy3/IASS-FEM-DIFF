@@ -2,7 +2,8 @@
  * Writes a self-contained HTML 3D viewer (Three.js) with image upload.
  * Sidecar `<stem>.meta.json` is fetched automatically (same stem as the image) from
  * ../data/processed/displacement_rgb/trig/ or ./ relative to the HTML URL.
- * Without a successful fetch, decoding uses auto scale per channel.
+ * Without a successful fetch, decoding uses auto scale per channel (legacy). New JPEGs use
+ * extra.rgb_mapping.encoding === "fixed_linear" (physical ±15 → byte 0…255).
  *
  * Usage (from repo root):
  *   node scripts/view-trig-surface.js
@@ -90,11 +91,15 @@ function buildViewerHtml() {
     </div>
     <div class="row">
       <label>Mesh subdiv <input type="number" id="meshSubdiv" value="2" min="1" max="8" step="1" /></label>
+      <label title="Blur decoded displacement (reduces JPEG blocking / jagged facets)">Disp smooth <input type="number" id="dispSmooth" value="1" min="0" max="6" step="1" /></label>
       <label title="Box blur radius on sag before stress (reduces JPEG speckle)">Stress smooth <input type="number" id="stressSmooth" value="2" min="0" max="6" step="1" /></label>
       <label title="Curvature uses neighbors ±span rows (wider sampling)">Stress span <input type="number" id="stressSpan" value="2" min="1" max="6" step="1" /></label>
     </div>
     <div class="row">
       <label><input type="checkbox" id="showBase" checked /> Show flat reference grid</label>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="showGravity" /> Show gravity vectors (−Z)</label>
     </div>
     <div class="row">
       <label><input type="checkbox" id="animateMorph" /> Animate plane → UV displacement (loop)</label>
@@ -127,9 +132,11 @@ const imgFile = document.getElementById('imgFile');
 const planeSizeEl = document.getElementById('planeSize');
 const dispScaleEl = document.getElementById('dispScale');
 const showBaseEl = document.getElementById('showBase');
+const showGravityEl = document.getElementById('showGravity');
 const femDispColorsEl = document.getElementById('femDispColors');
 const femStressColorsEl = document.getElementById('femStressColors');
 const meshSubdivEl = document.getElementById('meshSubdiv');
+const dispSmoothEl = document.getElementById('dispSmooth');
 const stressSmoothEl = document.getElementById('stressSmooth');
 const stressSpanEl = document.getElementById('stressSpan');
 const animateMorphEl = document.getElementById('animateMorph');
@@ -177,9 +184,25 @@ function decodeChannelAuto(byte, T) {
 
 function getChannels(meta) {
   if (!meta || !meta.extra || !meta.extra.channel_min_max_raw) return null;
+  const rm = meta.extra.rgb_mapping;
+  if (rm && rm.encoding === 'fixed_linear') return null;
   const c = meta.extra.channel_min_max_raw;
   if (!c.x || !c.y || !c.z) return null;
   return { x: c.x, y: c.y, z: c.z };
+}
+
+/** @returns {{ lo: number, hi: number } | null} */
+function getFixedLinearRange(meta) {
+  const rm = meta && meta.extra && meta.extra.rgb_mapping;
+  if (!rm || rm.encoding !== 'fixed_linear') return null;
+  const lo = Number(rm.physical_min);
+  const hi = Number(rm.physical_max);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+  return { lo, hi };
+}
+
+function decodeChannelFixed(byte, lo, hi) {
+  return lo + (byte / 255) * (hi - lo);
 }
 
 /** Match Python displacement_magnitude_to_rgb (white → pink). Returns RGB in 0..1. */
@@ -227,6 +250,29 @@ function parseStressFlat(meta, W, H) {
     const gh = ex.fem_stress_grid.height;
     if (gw != null && gh != null && (gw !== W || gh !== H)) {
       console.warn('fem_stress_grid size mismatch vs image', gw, gh, W, H);
+    }
+  }
+  if (!Array.isArray(raw) || raw.length < n) return null;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = Number(raw[i]);
+  return out;
+}
+
+/**
+ * Per-vertex deflection magnitude samples aligned with image pixels (row-major). Optional in sidecar.
+ * Supports extra.fem_disp_flat: number[] or extra.fem_disp_grid: { values, width?, height? }.
+ */
+function parseDispMagFlat(meta, W, H) {
+  const n = W * H;
+  const ex = meta && meta.extra;
+  if (!ex) return null;
+  let raw = ex.fem_disp_flat;
+  if (raw == null && ex.fem_disp_grid && Array.isArray(ex.fem_disp_grid.values)) {
+    raw = ex.fem_disp_grid.values;
+    const gw = ex.fem_disp_grid.width;
+    const gh = ex.fem_disp_grid.height;
+    if (gw != null && gh != null && (gw !== W || gh !== H)) {
+      console.warn('fem_disp_grid size mismatch vs image', gw, gh, W, H);
     }
   }
   if (!Array.isArray(raw) || raw.length < n) return null;
@@ -505,22 +551,26 @@ function buildBuffers(
   femDeflectionColors,
   femStressColors,
   subdiv,
+  dispBlurR,
   stressBlurR,
   stressSpan
 ) {
-  const ch = getChannels(meta);
-  const Tr = ch ? null : maxAbsT(rgba, W, H, 0);
-  const Tg = ch ? null : maxAbsT(rgba, W, H, 1);
-  const Tb = ch ? null : maxAbsT(rgba, W, H, 2);
+  const fixed = getFixedLinearRange(meta);
+  const ch = fixed ? null : getChannels(meta);
+  const Tr = fixed || ch ? null : maxAbsT(rgba, W, H, 0);
+  const Tg = fixed || ch ? null : maxAbsT(rgba, W, H, 1);
+  const Tb = fixed || ch ? null : maxAbsT(rgba, W, H, 2);
 
   const n = W * H;
+  const dispMagFlat = parseDispMagFlat(meta, W, H);
   const stressFlat = parseStressFlat(meta, W, H);
   const sub = Math.max(1, Math.min(8, Math.floor(subdiv)));
   const blurR = Math.max(0, Math.min(6, Math.floor(stressBlurR)));
   const span = Math.max(1, Math.min(6, Math.floor(stressSpan)));
 
-  const posCoarse = new Float32Array(n * 3);
-
+  const dxArr = new Float32Array(n);
+  const dyArr = new Float32Array(n);
+  const dzArr = new Float32Array(n);
   for (let j = 0; j < H; j++) {
     for (let i = 0; i < W; i++) {
       const k = j * W + i;
@@ -528,24 +578,44 @@ function buildBuffers(
       const r = rgba[p];
       const gch = rgba[p + 1];
       const bch = rgba[p + 2];
+      dxArr[k] = fixed
+        ? decodeChannelFixed(r, fixed.lo, fixed.hi)
+        : ch
+          ? decodeChannelMeta(r, ch.x)
+          : decodeChannelAuto(r, Tr);
+      dyArr[k] = fixed
+        ? decodeChannelFixed(gch, fixed.lo, fixed.hi)
+        : ch
+          ? decodeChannelMeta(gch, ch.y)
+          : decodeChannelAuto(gch, Tg);
+      dzArr[k] = fixed
+        ? decodeChannelFixed(bch, fixed.lo, fixed.hi)
+        : ch
+          ? decodeChannelMeta(bch, ch.z)
+          : decodeChannelAuto(bch, Tb);
+    }
+  }
+  const dBlur = Math.max(0, Math.min(6, Math.floor(dispBlurR)));
+  const dxB = dBlur > 0 ? boxBlurGrid2D(dxArr, W, H, dBlur) : dxArr;
+  const dyB = dBlur > 0 ? boxBlurGrid2D(dyArr, W, H, dBlur) : dyArr;
+  const dzB = dBlur > 0 ? boxBlurGrid2D(dzArr, W, H, dBlur) : dzArr;
 
-      const dx = ch ? decodeChannelMeta(r, ch.x) : decodeChannelAuto(r, Tr);
-      const dy = ch ? decodeChannelMeta(gch, ch.y) : decodeChannelAuto(gch, Tg);
-      const dz = ch ? decodeChannelMeta(bch, ch.z) : decodeChannelAuto(bch, Tb);
-
+  const posCoarse = new Float32Array(n * 3);
+  for (let j = 0; j < H; j++) {
+    for (let i = 0; i < W; i++) {
+      const k = j * W + i;
       const u = i / (W - 1);
       const v = j / (H - 1);
       const bx = (u - 0.5) * plane;
       const by = (v - 0.5) * plane;
-
-      posCoarse[k * 3] = bx + dispScale * dx;
-      posCoarse[k * 3 + 1] = by + dispScale * dy;
-      posCoarse[k * 3 + 2] = dispScale * dz;
+      posCoarse[k * 3] = bx + dispScale * dxB[k];
+      posCoarse[k * 3 + 1] = by + dispScale * dyB[k];
+      posCoarse[k * 3 + 2] = dispScale * dzB[k];
     }
   }
 
   let wStar = null;
-  if (femDeflectionColors || (femStressColors && !stressFlat)) {
+  if ((femDeflectionColors && !dispMagFlat) || (femStressColors && !stressFlat)) {
     const zz = new Float32Array(n);
     for (let ii = 0; ii < n; ii++) zz[ii] = posCoarse[ii * 3 + 2];
     wStar = chordRelativeSagZ(zz, W, H);
@@ -580,7 +650,19 @@ function buildBuffers(
 
   let magLo = 0;
   let magHi = 1;
-  if (femDeflectionColors && wStar) {
+  if (femDeflectionColors && dispMagFlat) {
+    magLo = Infinity;
+    magHi = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const m = Math.abs(dispMagFlat[i]);
+      if (m < magLo) magLo = m;
+      if (m > magHi) magHi = m;
+    }
+    if (!isFinite(magLo) || !isFinite(magHi) || magHi <= magLo) {
+      magLo = 0;
+      magHi = 1;
+    }
+  } else if (femDeflectionColors && wStar) {
     magLo = Infinity;
     magHi = -Infinity;
     for (let i = 0; i < n; i++) {
@@ -610,6 +692,11 @@ function buildBuffers(
       if (femStressColors) {
         const s = stressSamples ? stressSamples[k] : 0;
         const rgb = stressSignedToLinearRgb(s, stressLim);
+        cr = rgb[0];
+        cg = rgb[1];
+        cb = rgb[2];
+      } else if (femDeflectionColors && dispMagFlat) {
+        const rgb = displacementMagToLinearRgb(Math.abs(dispMagFlat[k]), magLo, magHi);
         cr = rgb[0];
         cg = rgb[1];
         cb = rgb[2];
@@ -686,6 +773,7 @@ let morphDef = null;
 let morphGridW = 0;
 let morphGridH = 0;
 let morphStartTime = 0;
+let gravityGroup = null;
 
 function disposeAnchorLines() {
   if (!anchorGroup) return;
@@ -695,6 +783,51 @@ function disposeAnchorLines() {
   });
   scene.remove(anchorGroup);
   anchorGroup = null;
+}
+
+function disposeGravity() {
+  if (!gravityGroup) return;
+  gravityGroup.traverse((obj) => {
+    if (obj.geometry) obj.geometry.dispose();
+    if (obj.material) obj.material.dispose();
+  });
+  scene.remove(gravityGroup);
+  gravityGroup = null;
+}
+
+function makeGravityViz(positions, W, H) {
+  const g = new THREE.Group();
+  const globalArrow = new THREE.ArrowHelper(
+    new THREE.Vector3(0, 0, -1),
+    new THREE.Vector3(0, 0, 0),
+    0.4,
+    0x66ccff,
+    0.12,
+    0.08
+  );
+  g.add(globalArrow);
+
+  const step = Math.max(4, Math.floor(Math.max(W, H) / 12));
+  for (let j = 0; j < H; j += step) {
+    for (let i = 0; i < W; i += step) {
+      const k = j * W + i;
+      const o = new THREE.Vector3(
+        positions[k * 3],
+        positions[k * 3 + 1],
+        positions[k * 3 + 2]
+      );
+      const a = new THREE.ArrowHelper(
+        new THREE.Vector3(0, 0, -1),
+        o,
+        0.18,
+        0x66ccff,
+        0.06,
+        0.04
+      );
+      g.add(a);
+    }
+  }
+  return g;
 }
 
 /** Pinned supports: all four boundary polylines (u and v min/max) on the deformed mesh. */
@@ -751,6 +884,8 @@ const camera = new THREE.PerspectiveCamera(
   0.01,
   1000
 );
+// Use Z-up (Three defaults to Y-up).
+camera.up.set(0, 0, 1);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio || 1);
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -759,6 +894,7 @@ document.body.appendChild(renderer.domElement);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
+controls.screenSpacePanning = false;
 
 function disposeMesh(m) {
   if (!m) return;
@@ -844,10 +980,13 @@ function rebuildFromRgba(rgba, W, H, meta, metaHint) {
   let dispScale = parseFloat(dispScaleEl.value, 10);
   if (!isFinite(dispScale) || dispScale < 0) dispScale = 1;
   const showBase = showBaseEl.checked;
+  const showGravity = showGravityEl.checked;
   const femDeflectionColors = femDispColorsEl.checked;
   const femStressColors = femStressColorsEl.checked;
   let meshSubdiv = parseInt(meshSubdivEl.value, 10);
   if (!Number.isFinite(meshSubdiv) || meshSubdiv < 1) meshSubdiv = 1;
+  let dispSmooth = parseInt(dispSmoothEl.value, 10);
+  if (!Number.isFinite(dispSmooth) || dispSmooth < 0) dispSmooth = 0;
   let stressSmooth = parseInt(stressSmoothEl.value, 10);
   if (!Number.isFinite(stressSmooth) || stressSmooth < 0) stressSmooth = 0;
   let stressSpanVal = parseInt(stressSpanEl.value, 10);
@@ -883,6 +1022,7 @@ function rebuildFromRgba(rgba, W, H, meta, metaHint) {
     femDeflectionColors,
     femStressColors,
     meshSubdiv,
+    dispSmooth,
     stressSmooth,
     stressSpanVal
   );
@@ -890,6 +1030,7 @@ function rebuildFromRgba(rgba, W, H, meta, metaHint) {
   disposeMesh(mesh);
   disposeMesh(wire);
   disposeAnchorLines();
+  disposeGravity();
 
   const pos = new Float32Array(buf.positions);
   const col = new Float32Array(buf.colors);
@@ -939,6 +1080,11 @@ function rebuildFromRgba(rgba, W, H, meta, metaHint) {
       buf.gridH
     );
     scene.add(anchorGroup);
+  }
+
+  if (showGravity) {
+    gravityGroup = makeGravityViz(buf.positions, buf.gridW, buf.gridH);
+    scene.add(gravityGroup);
   }
 
   fitCamera(geo);
@@ -1095,8 +1241,10 @@ function rebuildFromCache() {
 femDispColorsEl.addEventListener('change', rebuildFromCache);
 femStressColorsEl.addEventListener('change', rebuildFromCache);
 meshSubdivEl.addEventListener('change', rebuildFromCache);
+dispSmoothEl.addEventListener('change', rebuildFromCache);
 stressSmoothEl.addEventListener('change', rebuildFromCache);
 stressSpanEl.addEventListener('change', rebuildFromCache);
+showGravityEl.addEventListener('change', rebuildFromCache);
 
 animateMorphEl.addEventListener('change', () => {
   if (!mesh || !morphFlat || !morphDef) return;

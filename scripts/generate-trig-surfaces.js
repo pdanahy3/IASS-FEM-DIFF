@@ -3,11 +3,9 @@
  * u and v sample degree ranges from the full permutation set: each axis uses a span
  * [min,max] with min,max ∈ {0,90,180,270,360} and min≤max (15 u-spans × 15 v-spans = 225
  * domains). That Cartesian product extends the total count with formula × coefficient combos.
- * Per pixel:
- * formula triple; R=x, G=y, B=z with symmetric encoding: 0 → mid gray (127.5),
- * −R_ext → 0, +R_ext → 255, where R_ext = max(|min|, |max|) on that channel.
- * If a channel is spatially constant (no u,v variation), it is encoded as mid
- * gray (128) so solid “1×coeff” axes do not wash out the image as all white.
+ * Per pixel: formula triple; R=x, G=y, B=z with a fixed linear map
+ * physical ∈ [-15, 15] → byte ∈ [0, 255] on each channel (clamp). Same scale on
+ * every sample so training, inference, and the viewer share one decode.
  * Writes JPEG (RGB via jpeg-js). Run `npm install` once in the repo root.
  *
  * Usage (from repo root):
@@ -269,7 +267,7 @@ function displacementStats(xs, ys, zs) {
 }
 
 /**
- * Min/max and symmetric extent R = max(|min|, |max|) for zero-mid encoding.
+ * Min/max over a channel (and R = max(|min|,|max|)) for sidecar statistics only.
  * @param {Float32Array} arr
  */
 function channelMinMaxExtent(arr) {
@@ -286,56 +284,38 @@ function channelMinMaxExtent(arr) {
   return { mn, mx, R };
 }
 
-const CHANNEL_CONST_EPS = 1e-7;
+const FIXED_PHYS_MIN = -15;
+const FIXED_PHYS_MAX = 15;
 
 /**
- * R ← x, G ← y, B ← z. value 0 → 127.5; −R → 0; +R → 255 (clamped).
- * Spatially flat channels → 128 (avoids all-white when x,y,z are constants).
+ * R ← x, G ← y, B ← z. Linear: physical FIXED_PHYS_MIN → 0, FIXED_PHYS_MAX → 255 (clamped).
  * @param {Float32Array} xs
  * @param {Float32Array} ys
  * @param {Float32Array} zs
  */
-function zeroMidChannelsToRGBA(xs, ys, zs, width, height) {
+function fixedLinearChannelsToRGBA(xs, ys, zs, width, height) {
+  const span = FIXED_PHYS_MAX - FIXED_PHYS_MIN;
+  const toByte = (v) =>
+    Math.round(
+      Math.min(255, Math.max(0, (255 * (v - FIXED_PHYS_MIN)) / span))
+    );
+  const rgba = new Uint8Array(width * height * 4);
+  for (let k = 0; k < width * height; k++) {
+    const p = k * 4;
+    rgba[p] = toByte(xs[k]);
+    rgba[p + 1] = toByte(ys[k]);
+    rgba[p + 2] = toByte(zs[k]);
+    rgba[p + 3] = 255;
+  }
   const X = channelMinMaxExtent(xs);
   const Y = channelMinMaxExtent(ys);
   const Z = channelMinMaxExtent(zs);
-  const xConst = X.mx - X.mn <= CHANNEL_CONST_EPS;
-  const yConst = Y.mx - Y.mn <= CHANNEL_CONST_EPS;
-  const zConst = Z.mx - Z.mn <= CHANNEL_CONST_EPS;
-  const rgba = new Uint8Array(width * height * 4);
-  for (let j = 0; j < height; j++) {
-    for (let i = 0; i < width; i++) {
-      const k = j * width + i;
-      const encVar = (v, R) =>
-        Math.round(Math.min(255, Math.max(0, 127.5 * (1 + v / R))));
-      const p = k * 4;
-      rgba[p] = xConst ? 128 : encVar(xs[k], X.R);
-      rgba[p + 1] = yConst ? 128 : encVar(ys[k], Y.R);
-      rgba[p + 2] = zConst ? 128 : encVar(zs[k], Z.R);
-      rgba[p + 3] = 255;
-    }
-  }
   return {
     rgba,
     norm: {
-      x: {
-        min: X.mn,
-        max: X.mx,
-        extent_R: xConst ? null : X.R,
-        spatially_constant: xConst,
-      },
-      y: {
-        min: Y.mn,
-        max: Y.mx,
-        extent_R: yConst ? null : Y.R,
-        spatially_constant: yConst,
-      },
-      z: {
-        min: Z.mn,
-        max: Z.mx,
-        extent_R: zConst ? null : Z.R,
-        spatially_constant: zConst,
-      },
+      x: { min: X.mn, max: X.mx },
+      y: { min: Y.mn, max: Y.mx },
+      z: { min: Z.mn, max: Z.mx },
     },
   };
 }
@@ -406,7 +386,7 @@ function main() {
     }
 
     const { maxDisp, avgDisp } = displacementStats(xs, ys, zs);
-    const { rgba, norm } = zeroMidChannelsToRGBA(xs, ys, zs, W, H);
+    const { rgba, norm } = fixedLinearChannelsToRGBA(xs, ys, zs, W, H);
 
     const domTag = [
       `d${String(idom).padStart(3, "0")}`,
@@ -453,12 +433,14 @@ function main() {
           v: [domain.vMinDeg, domain.vMaxDeg],
         },
         rgb_mapping: {
+          encoding: "fixed_linear",
+          physical_min: FIXED_PHYS_MIN,
+          physical_max: FIXED_PHYS_MAX,
           R: "x",
           G: "y",
           B: "z",
-          zero_to_byte: 127.5,
-          extent:
-            "per_channel max(|min|,|max|); spatially flat channel → byte 128",
+          byte_formula:
+            "byte = round(255 * (value - physical_min) / (physical_max - physical_min)), clamped",
         },
         formula_indices: { x: ix, y: iy, z: iz },
         formula_labels: {
@@ -468,24 +450,9 @@ function main() {
         },
         coefficients: { x: cx, y: cy, z: cz },
         channel_min_max_raw: {
-          x: {
-            min: norm.x.min,
-            max: norm.x.max,
-            extent_R: norm.x.extent_R,
-            spatially_constant: norm.x.spatially_constant,
-          },
-          y: {
-            min: norm.y.min,
-            max: norm.y.max,
-            extent_R: norm.y.extent_R,
-            spatially_constant: norm.y.spatially_constant,
-          },
-          z: {
-            min: norm.z.min,
-            max: norm.z.max,
-            extent_R: norm.z.extent_R,
-            spatially_constant: norm.z.spatially_constant,
-          },
+          x: { min: norm.x.min, max: norm.x.max },
+          y: { min: norm.y.min, max: norm.y.max },
+          z: { min: norm.z.min, max: norm.z.max },
         },
       },
     };

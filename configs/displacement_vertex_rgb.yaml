@@ -8,8 +8,12 @@ model_family: vertex_displacement_rgb
 data:
   processed_dir: data/processed/displacement_rgb/trig
   image_size: [80, 80]
-  # extent_from_meta: divide (byte/127.5-1) by per-channel extent_R from sidecar when present
-  normalization: extent_from_meta
+  # fixed_linear: byte 0..255 ↔ physical [-15,15] per axis (see generate-trig-surfaces.js); extent=15 for FEM
+  # extent_from_meta: legacy zero-mid JPEGs + per-channel extent_R in sidecar
+  normalization: fixed_linear
+  # If true, expects `.meta.json` to include extra.fem_stress_grid (von Mises) and appends it as channel 4.
+  include_fem_stress: true
+  fem_stress_norm: 0.0
 
 training:
   seed: 42

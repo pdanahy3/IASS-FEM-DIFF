@@ -25,11 +25,14 @@ def _load_yaml(path: Path) -> dict:
 
 
 def _collate_batch(samples: list[dict]) -> dict[str, torch.Tensor | list]:
-    return {
+    out: dict[str, torch.Tensor | list] = {
         "pixel_values": torch.stack([s["pixel_values"] for s in samples], dim=0),
         "extent": torch.stack([s["extent"] for s in samples], dim=0),
         "path": [str(s["path"]) for s in samples],
     }
+    if "fem_stress" in samples[0]:
+        out["fem_stress"] = torch.stack([s.get("fem_stress") for s in samples], dim=0)  # type: ignore[arg-type]
+    return out
 
 
 def train_from_config(config_path: Path) -> None:
@@ -65,6 +68,8 @@ def train_from_config(config_path: Path) -> None:
     plane = float(fem_cfg.get("plane_size", 2.0))
     fem_span = int(fem_cfg.get("curvature_span", 1))
     vert_ch = int(fem_cfg.get("vertical_channel", 2))
+
+    phys_scale = 15.0 if disp_cfg.normalization == "fixed_linear" else 1.0
 
     torch.manual_seed(seed)
 
@@ -114,10 +119,11 @@ def train_from_config(config_path: Path) -> None:
     hx = plane / max(iw - 1, 1)
     hy = plane / max(ih - 1, 1)
     h, w = ih, iw
+    in_ch = 4 if disp_cfg.include_fem_stress else 3
     model = UNet2DModel(
         sample_size=h,
-        in_channels=3,
-        out_channels=3,
+        in_channels=in_ch,
+        out_channels=in_ch,
         layers_per_block=2,
         block_out_channels=(64, 128, 128, 256),
         down_block_types=(
@@ -149,6 +155,14 @@ def train_from_config(config_path: Path) -> None:
 
         for batch in loader:
             images = batch["pixel_values"].to(device)
+            if in_ch == 4:
+                fem_s = batch.get("fem_stress")
+                if fem_s is None:
+                    raise RuntimeError(
+                        "data.include_fem_stress is true but dataset did not provide fem_stress. "
+                        "Run `iass-fem-diff precompute-fem-trig ...` first."
+                    )
+                images = torch.cat([images, fem_s.to(device)], dim=1)
             extent = batch["extent"].to(device)
             b = images.shape[0]
             noise = torch.randn_like(images)
@@ -166,7 +180,7 @@ def train_from_config(config_path: Path) -> None:
                 sqrt_oma = torch.sqrt((1.0 - a_bar).clamp(min=1e-8))
                 x0_hat = (noisy - sqrt_oma * noise_pred) / sqrt_a
                 x0_hat = x0_hat.clamp(-1.0, 1.0)
-                disp = x0_hat * extent.view(b, 3, 1, 1)
+                disp = x0_hat[:, :3] * extent.view(b, 3, 1, 1)
                 loss_fem = structural_efficiency_loss(
                     disp,
                     vertical_channel=vert_ch,
@@ -207,6 +221,8 @@ def train_from_config(config_path: Path) -> None:
                 "curvature_hx": hx,
                 "curvature_hy": hy,
                 "curvature_span": fem_span,
+                "vertex_rgb_phys_scale": phys_scale,
+                "vertex_rgb_normalization": disp_cfg.normalization,
             },
             ckpt_path,
         )
