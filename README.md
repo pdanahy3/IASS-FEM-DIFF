@@ -1,93 +1,148 @@
 # IASS-FEM-DIFF
 
-Training and checkpoint layout for image-based diffusion models on shell displacement and FEM-derived fields, with a future path to Rhino 3D inference and multi-model agent guidance.
+Training and inference scaffolding for image-based diffusion on shell **displacement rasters** (RGB = \(d_x,d_y,d_z\)) and optional **FEM-derived fields**, with a browser **3D viewer** and offline **reference FEM** (scikit-fem) for visualization and dataset enrichment.
 
-## Scope (current)
-
-This repository is set up for **training only**: producing weights/checkpoints you can later load for inference. **Rhino integration** (Python GH component or C# plugin, competing diffusion priors over a designer-defined u,v surface) is **out of scope** for now; see [docs/RHINO_ROADMAP.md](docs/RHINO_ROADMAP.md).
-
-## Model families
-
-### 1. Vertex displacement as RGB (unsupervised, unstructured mesh)
-
-- **Idea:** Each training sample is a raster image whose **R, G, B** channels encode **X, Y, Z** vertex displacement (after a fixed normalization), for meshes that share the same **u,v** topology as your training corpus.
-- **Unstructured data:** Meshes are not on a regular grid; you **rasterize** (or otherwise map) per-vertex displacements onto a 2D image (e.g. canonical UV layout, or a consistent orthographic view) so a 2D diffusion model can operate on fixed-resolution tensors.
-- **Unsupervised training:** Learn the distribution of these RGB displacement images (e.g. DDPM / latent diffusion) **without** paired “target” labels beyond the samples themselves.
-- **Trig surfaces + FEM steering:** Synthetic trig JPEGs from `scripts/generate-trig-surfaces.js` can train a DDPM via `train-vertex-rgb`. The loss is **noise prediction MSE** plus **`fem.loss_weight` × structural proxy** on the predicted clean image: **four-edge** pinned reference (Coons sag (w*)) and mean **Laplacian (Δw*)²**, matching `scripts/view-trig-surface.js`. Tune `fem.loss_weight`, `fem.plane_size`, and `fem.curvature_span` in `configs/displacement_vertex_rgb.yaml`.
-
-### 2. FEM-informed maps (two checkpoints)
-
-Separate trained models (separate checkpoints) for:
-
-| Checkpoint | Input | Output image semantics |
-|------------|--------|-------------------------|
-| **FEM displacement** | Conditioning image(s) from `data/` (see config) | Scalar displacement field encoded **white → pink** (monotone colormap). |
-| **FEM stress** | Same idea | Signed or von Mises–style stress encoded **blue (compression) → white (neutral) → red (tension)**. Exact sign convention should match your solver exports; adjust in `viz/colormaps.py` when you wire real FEM data. |
-
-Each generated or exported training/output image should have a **sidecar metadata** JSON with at least:
-
-- `max_displacement`, `avg_displacement`
-- `max_stress`, `avg_stress`
-
-(Units and coordinate system should be documented per dataset in `data/README.md`.)
-
-## Repository layout
-
-```
-configs/          # YAML training configs (two families + FEM sub-checkpoints)
-data/             # Place raw/processed inputs here (not committed)
-docs/             # Design notes and Rhino roadmap
-outputs/          # Checkpoints and samples (not committed)
-src/iass_fem_diff/
-  cli.py          # Typer entrypoint
-  datasets/       # Trig RGB dataset + FEM map stubs
-  io/metadata.py # Metadata schema + read/write
-  physics/        # Differentiable FEM proxy (four-edge sag, Laplacian)
-  train/          # DDPM on trig RGB (`trig_diffusion.py`)
-  viz/colormaps.py # FEM visualization conventions
-```
-
-## Quick start (after you add dependencies)
-
-On **Windows 11**, use **PowerShell** (or Command Prompt) from the repo root. The library lives under `src/`. You must either **install it in editable mode** (recommended) or set `PYTHONPATH=src` before running modules.
+## Quick start
 
 ```powershell
 cd IASS-FEM-DIFF
 python -m venv .venv
 .\.venv\Scripts\activate
-pip install -r requirements.txt
 pip install -e ".[train]"
+npm install
 python -m iass_fem_diff.cli --help
 ```
 
-Use the **same** `python` / `pip` pair (e.g. if you use `C:\Python314\python.exe`, run `C:\Python314\python.exe -m pip install -e ".[train]"` from the repo root).
+- **Trig data:** `node scripts/generate-trig-surfaces.js --max N`
+- **Train:** `python -m iass_fem_diff.cli train-vertex-rgb configs/displacement_vertex_rgb.yaml`
+- **Sample:** `python -m iass_fem_diff.cli sample-vertex-rgb <checkpoint.pt> --out-dir outputs/samples/run1`
 
-**Without installing:** from the repo root, `PYTHONPATH=src` (PowerShell: `$env:PYTHONPATH = "src"`), then `python -m iass_fem_diff.cli ...`.
+GPU/CUDA notes and troubleshooting remain as in earlier docs; use a CUDA-enabled PyTorch wheel if `torch.cuda.is_available()` is `False`.
 
-Train on trig JPEGs:
+---
 
-```powershell
-node scripts/generate-trig-surfaces.js --max 2000
-python -m iass_fem_diff.cli train-vertex-rgb configs/displacement_vertex_rgb.yaml
-```
+## Command-line interface
 
-**GPU (Windows 11 + NVIDIA):** The training loop uses `.to(device)` with `device: cuda` in `configs/displacement_vertex_rgb.yaml` (or `auto` to pick CUDA when available).
+Entry point: **`python -m iass_fem_diff.cli`** (or **`iass-fem-diff`** after `pip install -e .`).
 
-If `torch.cuda.is_available()` is **False** even though `nvidia-smi` works, your PyTorch build is almost certainly **CPU-only**. Check the version string: `2.11.0+cpu` means no CUDA in that install (bundled CUDA in PyTorch is separate from the NVIDIA driver). Replace it with a CUDA wheel, e.g.:
+| Command | Purpose |
+|--------|---------|
+| `train-vertex-rgb` | Train DDPM on trig displacement RGB rasters (optional FEM proxy loss + optional 4th channel for precomputed stress). |
+| `sample-vertex-rgb` | Batch sample PNG + `.meta.json` from a checkpoint (includes reference FEM summary on final outputs). |
+| `sample-vertex-rgb-guided` | Single-sample guided run: step PNGs, `run.json`, `metrics.csv`, optional seed/goal images. |
+| `precompute-fem-trig` | Offline reference linear-elasticity FEM → writes `fem_stress_grid` / `fem_disp_grid` into each `.meta.json`. |
+| `render-guided-run-3d` | Turn a guided run’s `step_*.png` into fixed-camera 3D surface PNGs (matplotlib). |
+| `train-fem-field` | Stub: lists FEM field map dataset (full training not wired). |
+| `configs` | Print `configs/*.yaml` paths. |
 
-```powershell
-python -m pip install torch torchvision --upgrade --index-url https://download.pytorch.org/whl/cu128
-```
-
-Use the **same** `python` you use for training (`where python` — Windows may list several). After installing, you should see `+cu128` (or similar), not `+cpu`:
+### `train-vertex-rgb`
 
 ```text
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python -m iass_fem_diff.cli train-vertex-rgb <config.yaml>
 ```
 
-You want `torch.cuda.is_available()` → `True` and a non-empty `torch.version.cuda`. See [pytorch.org/get-started](https://pytorch.org/get-started/locally/) if you need a different CUDA flavor.
+- **Config:** `configs/displacement_vertex_rgb.yaml` — `data.normalization` (`fixed_linear` vs legacy `extent_from_meta`), `data.include_fem_stress`, `data.fem_stress_norm`, `training.*`, `diffusion.*`, `fem.*` (proxy loss weight, plane size, curvature span).
+- **Loss:** noise MSE + optional `fem.loss_weight` × differentiable **Coons sag + Laplacian proxy** (`src/iass_fem_diff/physics/fem_proxy.py`).
+- **Checkpoints:** `outputs/checkpoints/.../unet_epoch_*.pt` (includes `vertex_rgb_phys_scale`, optional channel count inferred from weights).
 
-Other training commands (`train-fem-field`) remain stubs until you wire paired FEM map data.
+### `sample-vertex-rgb`
+
+```text
+python -m iass_fem_diff.cli sample-vertex-rgb <checkpoint.pt> [--out-dir DIR] [--num N] [--seed S] [--steps T] [--device cuda|cpu]
+```
+
+- Writes `sample_XXXX.png` + `sample_XXXX.meta.json` (fixed-linear RGB encoding, reference FEM fields when solve succeeds).
+
+### `sample-vertex-rgb-guided`
+
+```text
+python -m iass_fem_diff.cli sample-vertex-rgb-guided <checkpoint.pt> \
+  [--out-dir DIR] [--seed-image PATH] [--strength 0..1] [--goal-image PATH] [--goal-mix 0..1] \
+  [--seed S] [--steps T] [--save-every N] [--device cuda|cpu]
+```
+
+- **`--seed-image` + `--strength`:** img2img-style start (decode seed → forward noise to a starting timestep, then denoise). **`--strength 0`** disables the seed.
+- **`--goal-image` + `--goal-mix`:** mixes the model’s predicted noise with the noise implied by the goal \(x_0\) at each step (steering).
+- **Outputs:** `step_*_t*.png`, `final.png`, `run.json`, `metrics.csv`, optional `metrics.png` (if matplotlib available), `final_fem.json`.
+
+### `precompute-fem-trig`
+
+```text
+python -m iass_fem_diff.cli precompute-fem-trig \
+  [--processed-dir DIR] [--plane-size F] [--gravity-total F] [--E Pa] [--nu μ] [--overwrite] \
+  [--limit N] [--stride K] [--shard I] [--num-shards M]
+```
+
+- Requires **`scikit-fem`** (included in `pip install -e ".[train]"`).
+- Updates each `<stem>.meta.json` with `extra.fem_stress_grid`, `extra.fem_disp_grid`, and aggregate stress/displacement stats.
+- **Sharding:** run the same command in parallel with `--num-shards M --shard 0..M-1` to saturate CPU cores on large folders.
+
+### `render-guided-run-3d`
+
+```text
+python -m iass_fem_diff.cli render-guided-run-3d <run_dir> \
+  [--out-dir DIR] [--plane-size F] [--disp-scale F] [--disp-smooth R] \
+  [--color-mode z|rgb|fem_stress|fem_disp] [--clim-min A --clim-max B] [--fem-every N] \
+  [--elev °] [--azim °] [--every N] [--dpi D]
+```
+
+- **`--color-mode`:** height (`z`), image RGB (`rgb`), reference von Mises (`fem_stress`), reference |disp| with **white→pink** (`fem_disp`). `fem_*` modes solve FEM per frame (slow); use `--fem-every` to skip frames.
+- Default output: `<run_dir>/render_3d` if `--out-dir` omitted.
+
+### `configs`
+
+```text
+python -m iass_fem_diff.cli configs [--config-dir path]
+```
+
+### `train-fem-field`
+
+Stub only — prints dataset size and reminds to wire image-conditioned diffusion for FEM maps.
+
+---
+
+## Node.js scripts (`package.json`)
+
+| Script | Command | Role |
+|--------|---------|------|
+| Generate trig JPEGs + meta | `npm run generate-trig-surfaces` or `node scripts/generate-trig-surfaces.js` | Synthetic \(80\times80\) surfaces; **fixed linear** RGB map \([-15,15]\) per channel → bytes \([0,255]\). |
+| Build 3D viewer HTML | `npm run view-trig-surface` or `node scripts/view-trig-surface.js` | Writes `scripts/trig-viewer.html` (Three.js). |
+
+- **Viewer:** serve repo root (`npx serve .`) and open `/scripts/trig-viewer.html`; supports fixed-linear decode, optional sidecar FEM stress/deflection grids, disp smoothing, gravity arrows (Z-up), anchor polylines.
+
+---
+
+## Python package layout & features
+
+```
+src/iass_fem_diff/
+  cli.py                      # Typer CLI (all commands above)
+  datasets/
+    mesh_displacement_rgb.py  # Trig rasters + optional fem_stress channel from meta
+    fem_field_maps.py         # FEM map dataset stub
+  infer/
+    trig_sample.py            # Standard batch sampling
+    trig_guided_sample.py     # Guided / transparent sampling
+  train/
+    trig_diffusion.py         # DDPM training loop
+  physics/
+    fem_proxy.py              # Differentiable Coons + Laplacian proxy (training steering)
+    reference_fem_solver.py # Vendored scikit-fem linear elasticity
+    reference_fem_fields.py   # Perimeter BC + gravity load; solve on displacement grid
+  viz/
+    render_guided_run.py      # Matplotlib 3D frames from guided runs
+    colormaps.py              # FEM colormap conventions
+  io/metadata.py              # Sidecar JSON helpers
+```
+
+- **Encoding:** displacement channels use a **global** physical range (default ±15) mapped linearly to RGB bytes; see `data/README.md` and `configs/displacement_vertex_rgb.yaml`.
+- **FEM:** (1) **Proxy** for training gradients; (2) **Reference solve** for precompute, inference meta, and offline renders — not the same as backprop through a full FE system.
+
+---
+
+## Scope and roadmap
+
+Rhino / Grasshopper integration is **out of scope** for this repo’s current code; see `docs/RHINO_ROADMAP.md` if present.
 
 ## License
 
