@@ -77,6 +77,115 @@ def sample_vertex_rgb(
     console.print(f"[green]Wrote samples[/green] under {out}")
 
 
+@app.command("sample-vertex-rgb-guided")
+def sample_vertex_rgb_guided(
+    checkpoint: Path = typer.Argument(..., exists=True, readable=True),
+    out_dir: Path = typer.Option(
+        Path("outputs/samples/displacement_vertex_rgb_guided"),
+        "--out-dir",
+        help="Output directory for step PNGs + run.json + metrics.*",
+    ),
+    seed_image: Path | None = typer.Option(
+        None,
+        "--seed-image",
+        help="Optional 80×80 RGB displacement image (same encoding as training) to start from (img2img).",
+    ),
+    strength: float = typer.Option(
+        0.0,
+        "--strength",
+        help="img2img strength in [0,1]. 0 disables seed init; 1 starts from near pure noise.",
+    ),
+    goal_image: Path | None = typer.Option(
+        None,
+        "--goal-image",
+        help="Optional 80×80 goal image to steer toward during sampling.",
+    ),
+    goal_mix: float = typer.Option(
+        0.0,
+        "--goal-mix",
+        help="Steering amount in [0,1]. Mixes model eps with eps implied by goal x0.",
+    ),
+    seed: int = typer.Option(42, "--seed", help="Random seed."),
+    steps: int = typer.Option(1000, "--steps", help="DDPM inference steps."),
+    save_every: int = typer.Option(50, "--save-every", help="Save an intermediate PNG every N steps."),
+    device: str = typer.Option("cuda", "--device", help="Device: cuda|cpu"),
+) -> None:
+    """Guided sampling with step-by-step outputs + optional seed/goal images."""
+    ckpt_path = checkpoint.resolve()
+    repo_root = Path(__file__).resolve().parents[2]
+    out = out_dir if out_dir.is_absolute() else (repo_root / out_dir).resolve()
+    from iass_fem_diff.infer.trig_guided_sample import GuidedRunConfig, run_guided_sampling
+
+    run_guided_sampling(
+        GuidedRunConfig(
+            checkpoint_path=ckpt_path,
+            out_dir=out,
+            seed=int(seed),
+            steps=int(steps),
+            device=device,
+            seed_image=seed_image.resolve() if seed_image else None,
+            strength=float(strength),
+            goal_image=goal_image.resolve() if goal_image else None,
+            goal_mix=float(goal_mix),
+            save_every=int(save_every),
+        )
+    )
+    console.print(f"[green]Wrote guided run[/green] under {out}")
+
+
+@app.command("render-guided-run-3d")
+def render_guided_run_3d(
+    run_dir: Path = typer.Argument(..., exists=True, readable=True),
+    out_dir: Path = typer.Option(
+        None,
+        "--out-dir",
+        help="Output directory for rendered frames (default: <run_dir>/render_3d).",
+    ),
+    plane_size: float = typer.Option(2.0, "--plane-size", help="Reference plane size (XY)."),
+    disp_scale: float = typer.Option(1.0, "--disp-scale", help="Multiplier on decoded displacements."),
+    disp_smooth: int = typer.Option(1, "--disp-smooth", help="Box blur radius on decoded displacement (0=off)."),
+    color_mode: str = typer.Option(
+        "z",
+        "--color-mode",
+        help="Coloring: z | rgb | fem_stress | fem_disp. fem_* runs reference FEM per frame (slow).",
+    ),
+    clim_min: float | None = typer.Option(None, "--clim-min", help="Color min for scalar modes."),
+    clim_max: float | None = typer.Option(None, "--clim-max", help="Color max for scalar modes."),
+    fem_every: int = typer.Option(1, "--fem-every", help="When fem_* mode: compute FEM every Nth rendered frame."),
+    elev: float = typer.Option(28.0, "--elev", help="Camera elevation angle."),
+    azim: float = typer.Option(-50.0, "--azim", help="Camera azimuth angle."),
+    every: int = typer.Option(1, "--every", help="Render every Nth step frame."),
+    dpi: int = typer.Option(160, "--dpi", help="Output DPI (affects resolution)."),
+) -> None:
+    """Render `step_*.png` from a guided run folder as fixed-view 3D surface frames."""
+    repo_root = Path(__file__).resolve().parents[2]
+    rdir = run_dir.resolve()
+    odir = out_dir
+    if odir is None:
+        odir = rdir / "render_3d"
+    if not odir.is_absolute():
+        odir = (repo_root / odir).resolve()
+    from iass_fem_diff.viz.render_guided_run import RenderConfig, render_guided_run
+
+    render_guided_run(
+        RenderConfig(
+            run_dir=rdir,
+            out_dir=odir,
+            plane_size=float(plane_size),
+            disp_scale=float(disp_scale),
+            disp_smooth=int(disp_smooth),
+            color_mode=str(color_mode),
+            clim=None if (clim_min is None or clim_max is None) else (float(clim_min), float(clim_max)),
+            fem_every=int(fem_every),
+            elev=float(elev),
+            azim=float(azim),
+            every=int(every),
+            dpi=int(dpi),
+        )
+    )
+    console.print(f"[green]Wrote 3D frames[/green] under {odir}")
+
+
 @app.command("train-fem-field")
 def train_fem_field(config: Path = typer.Argument(..., exists=True, readable=True)) -> None:
     """Stub: image-conditioned diffusion for FEM displacement or stress maps."""

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from iass_fem_diff.datasets.mesh_displacement_rgb import (
@@ -64,7 +65,11 @@ def sample_from_checkpoint(
         if "vertex_rgb_phys_scale" in ckpt
         else FIXED_PHYS_EXTENT
     )
-    in_ch = int(ckpt.get("in_channels", ckpt.get("vertex_rgb_in_channels", 3)) or 3)
+    conv_in_w = state.get("conv_in.weight")
+    if isinstance(conv_in_w, torch.Tensor) and conv_in_w.ndim == 4:
+        in_ch = int(conv_in_w.shape[1])
+    else:
+        in_ch = int(ckpt.get("in_channels", ckpt.get("vertex_rgb_in_channels", 3)) or 3)
 
     w, h = int(image_size[0]), int(image_size[1])
     if w < 2 or h < 2:
