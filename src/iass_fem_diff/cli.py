@@ -21,7 +21,14 @@ console = Console()
 
 
 @app.command("train-vertex-rgb")
-def train_vertex_rgb(config: Path = typer.Argument(..., exists=True, readable=True)) -> None:
+def train_vertex_rgb(
+    config: Path = typer.Argument(..., exists=True, readable=True),
+    fem_ridge: bool = typer.Option(
+        False,
+        "--fem-ridge",
+        help="Maximize Laplacian proxy (subtract lambda*proxy from loss); ridge-seeking vs smooth sag. Overrides YAML fem.maximize_laplacian_proxy.",
+    ),
+) -> None:
     """Train DDPM on trig RGB rasters with optional FEM proxy loss (see config ``fem``)."""
     cfg_path = config.resolve()
     repo_root = cfg_path.parent.parent
@@ -37,7 +44,7 @@ def train_vertex_rgb(config: Path = typer.Argument(..., exists=True, readable=Tr
         raise typer.Exit(code=1)
     from iass_fem_diff.train.trig_diffusion import train_from_config
 
-    train_from_config(cfg_path)
+    train_from_config(cfg_path, maximize_laplacian_proxy=True if fem_ridge else None)
 
 
 @app.command("sample-vertex-rgb")
@@ -199,6 +206,92 @@ def train_fem_field(config: Path = typer.Argument(..., exists=True, readable=Tru
         "[yellow]Stub:[/yellow] use image-conditioned diffusion; "
         "emit targets with viz.colormaps + metadata sidecars in preprocessing."
     )
+
+
+@app.command("evaluate-inference-samples")
+def evaluate_inference_samples(
+    samples_dir: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        help="Folder of generated displacement PNG/JPEG images (e.g. outputs/samples/run1).",
+    ),
+    dataset_dir: Path | None = typer.Option(
+        None,
+        "--dataset-dir",
+        help="Trig training folder for nearest-neighbor MSE (design-language distance); "
+        "defaults to repo data/processed/displacement_rgb/trig when present.",
+    ),
+    skip_nearest_dataset: bool = typer.Option(
+        False,
+        "--skip-nearest-dataset",
+        help="Do not load training rasters; skip design-language MSE.",
+    ),
+    out_json: Path | None = typer.Option(
+        None,
+        "--out-json",
+        help="Write full metrics JSON (default: <samples_dir>/eval_fem_metrics.json).",
+    ),
+    out_csv: Path | None = typer.Option(
+        None,
+        "--out-csv",
+        help="Write per-sample CSV (default: <samples_dir>/eval_fem_metrics.csv).",
+    ),
+    plane_size: float = typer.Option(2.0, "--plane-size", help="Must match training / inference FEM."),
+    gravity_total: float = typer.Option(1.0, "--gravity-total"),
+    curvature_span: int = typer.Option(1, "--curvature-span", help="FEM proxy Laplacian span (training fem.curvature_span)."),
+    dataset_limit: int = typer.Option(
+        0,
+        "--dataset-limit",
+        help="Load at most N training images for nearest-neighbor (0 = all).",
+        min=0,
+    ),
+    width: int = typer.Option(80, "--width", min=2),
+    height: int = typer.Option(80, "--height", min=2),
+) -> None:
+    """
+    Reference FEM (scikit-fem) + FEM proxy loss + optional nearest-dataset MSE on inference outputs.
+
+    Checkpoints do not store historical proxy values; proxy loss is recomputed here on each image.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    default_ds = repo_root / "data" / "processed" / "displacement_rgb" / "trig"
+    if skip_nearest_dataset:
+        ds = None
+    elif dataset_dir is not None:
+        ds = dataset_dir.resolve() if dataset_dir.is_absolute() else (repo_root / dataset_dir).resolve()
+    elif default_ds.is_dir():
+        ds = default_ds
+    else:
+        ds = None
+
+    from iass_fem_diff.eval.inference_eval import evaluate_inference_folder, summarize_for_table, write_csv
+
+    summary = evaluate_inference_folder(
+        samples_dir.resolve(),
+        dataset_dir=ds,
+        image_size=(int(width), int(height)),
+        plane_size=float(plane_size),
+        gravity_total=float(gravity_total),
+        curvature_span=int(curvature_span),
+        dataset_limit=int(dataset_limit),
+    )
+
+    jpath = out_json or (samples_dir.resolve() / "eval_fem_metrics.json")
+    jpath.parent.mkdir(parents=True, exist_ok=True)
+    jpath.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    console.print(f"[green]Wrote[/green] {jpath}")
+
+    cpath = out_csv or (samples_dir.resolve() / "eval_fem_metrics.csv")
+    write_csv(summary["per_sample"], cpath)
+    console.print(f"[green]Wrote[/green] {cpath}")
+
+    tbl = summarize_for_table(summary)
+    console.print("[bold]Summary (paper-friendly)[/bold]")
+    for k, v in tbl.items():
+        console.print(f"  {k}: {v}")
 
 
 @app.command("configs")

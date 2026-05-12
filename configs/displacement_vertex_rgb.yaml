@@ -20,7 +20,7 @@ training:
   batch_size: 4
   num_epochs: 100
   learning_rate: 1.0e-4
-  checkpoint_dir: outputs/checkpoints/displacement_vertex_rgb
+  checkpoint_dir: outputs/checkpoints/displacement_vertex_rgb_1lossweight
   # auto: use CUDA if torch.cuda.is_available(); cuda: require GPU or fail; cpu: force CPU
   device: cuda
 
@@ -28,9 +28,12 @@ diffusion:
   num_train_timesteps: 1000
 
 # Differentiable proxy (viewer-consistent): pinned four edges (u and v), Coons sag w*,
-# Laplacian bending. Loss on predicted x0 steers toward lower curvature.
+# Laplacian bending. Loss on predicted x0 steers toward lower curvature by default.
+# Set maximize_laplacian_proxy: true (or CLI --fem-ridge) to subtract the proxy from the loss
+# so optimization increases mean squared Laplacian (ridge-seeking on this proxy only).
 fem:
-  loss_weight: 0.05
+  loss_weight: 1.0
+  maximize_laplacian_proxy: false
   plane_size: 2.0
   curvature_span: 1
   vertical_channel: 2

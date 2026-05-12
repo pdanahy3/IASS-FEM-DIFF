@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,16 @@ import torch
 from iass_fem_diff.datasets.mesh_displacement_rgb import FIXED_PHYS_EXTENT, FIXED_PHYS_MAX, FIXED_PHYS_MIN
 from iass_fem_diff.physics.fem_proxy import structural_efficiency_loss
 from iass_fem_diff.physics.reference_fem_fields import ReferenceFEMConfig, solve_reference_fem_on_displacement_grid
+
+
+@dataclass
+class GuidedDenoiseStep:
+    """One DDPM reverse step: decoded RGB displacement raster (uint8 H×W×3)."""
+
+    step_i: int
+    t: int
+    rgb_hwc_u8: np.ndarray
+    metrics: dict
 
 
 @dataclass
@@ -86,7 +97,13 @@ def _maybe_plot_metrics(out_dir: Path, rows: list[dict]) -> None:
     plt.close()
 
 
-def run_guided_sampling(cfg: GuidedRunConfig) -> None:
+def iter_guided_denoise(cfg: GuidedRunConfig) -> Iterator[GuidedDenoiseStep]:
+    """
+    Run the same denoising loop as ``run_guided_sampling``, yielding every step.
+
+    Yields decoded RGB (fixed-linear displacement encoding) after each scheduler update.
+    Does not write files or run reference FEM — use ``run_guided_sampling`` for full artifacts.
+    """
     try:
         from diffusers import DDPMScheduler, UNet2DModel
     except ImportError as e:
@@ -97,7 +114,7 @@ def run_guided_sampling(cfg: GuidedRunConfig) -> None:
     try:
         from PIL import Image
     except ImportError as e:
-        raise ImportError("Pillow is required to save images. Install with: pip install 'iass-fem-diff[train]'") from e
+        raise ImportError("Pillow is required. Install with: pip install 'iass-fem-diff[train]'") from e
 
     ckpt = torch.load(cfg.checkpoint_path, map_location="cpu")
     state = ckpt["model_state_dict"]
@@ -105,7 +122,6 @@ def run_guided_sampling(cfg: GuidedRunConfig) -> None:
     plane = float(ckpt.get("plane_size", 2.0))
     span = int(ckpt.get("curvature_span", 1))
     phys_scale = float(ckpt.get("vertex_rgb_phys_scale", FIXED_PHYS_EXTENT))
-    # Prefer inferring channel count from weights (robust to older checkpoints).
     conv_in_w = state.get("conv_in.weight")
     if isinstance(conv_in_w, torch.Tensor) and conv_in_w.ndim == 4:
         in_ch = int(conv_in_w.shape[1])
@@ -137,7 +153,6 @@ def run_guided_sampling(cfg: GuidedRunConfig) -> None:
     steps = int(cfg.steps) if cfg.steps is not None else train_T
     scheduler.set_timesteps(steps, device=dev)
 
-    # Prepare optional seed / goal x0 tensors (model units).
     x0_seed = None
     if cfg.seed_image:
         im = Image.open(cfg.seed_image).convert("RGB")
@@ -156,13 +171,11 @@ def run_guided_sampling(cfg: GuidedRunConfig) -> None:
             arr = np.asarray(im, dtype=np.uint8)
         x0_goal = _decode_rgb_to_model_units(arr, phys_scale).to(dev)
 
-    # Determine start timestep from strength.
     strength = float(cfg.strength)
     strength = 0.0 if not np.isfinite(strength) else max(0.0, min(1.0, strength))
     start_idx = int(round(strength * (len(scheduler.timesteps) - 1)))
     start_t = scheduler.timesteps[start_idx]
 
-    # Initialize x at start_t.
     if x0_seed is not None and strength > 0:
         noise = torch.randn((1, in_ch, 80, 80), device=dev, dtype=torch.float32)
         x = torch.zeros_like(noise)
@@ -171,8 +184,76 @@ def run_guided_sampling(cfg: GuidedRunConfig) -> None:
     else:
         x = torch.randn((1, in_ch, 80, 80), device=dev, dtype=torch.float32)
 
+    timesteps = list(scheduler.timesteps[start_idx:])
+    goal_mix = float(cfg.goal_mix)
+    goal_mix = 0.0 if not np.isfinite(goal_mix) else max(0.0, min(1.0, goal_mix))
+    hx = plane / 79.0
+    hy = plane / 79.0
+
+    with torch.no_grad():
+        for step_i, t in enumerate(timesteps):
+            out = model(x, t)
+            eps = out.sample if hasattr(out, "sample") else out[0]
+
+            goal_mse = 0.0
+            if x0_goal is not None and goal_mix > 0:
+                a_bar = scheduler.alphas_cumprod[t].to(dev)
+                sqrt_a = torch.sqrt(a_bar.clamp(min=1e-12))
+                sqrt_oma = torch.sqrt((1.0 - a_bar).clamp(min=1e-12))
+                x0g = torch.zeros_like(x)
+                x0g[:, :3] = x0_goal
+                eps_goal = (x - sqrt_a * x0g) / sqrt_oma
+                eps = (1.0 - goal_mix) * eps + goal_mix * eps_goal
+                x0_hat = (x - sqrt_oma * eps) / sqrt_a
+                goal_mse = float(torch.mean((x0_hat[:, :3] - x0_goal) ** 2).detach().cpu().item())
+
+            x = scheduler.step(eps, t, x).prev_sample
+
+            disp = x[:, :3].detach().clamp(-1.0, 1.0) * phys_scale
+            fem_proxy = float(
+                structural_efficiency_loss(disp, hx=hx, hy=hy, span=span).detach().cpu().item()
+            )
+            rgb = _to_uint8_rgb_fixed_linear(x[:, :3], phys_scale)[0]
+            yield GuidedDenoiseStep(
+                step_i=step_i,
+                t=int(t),
+                rgb_hwc_u8=rgb,
+                metrics={
+                    "step": step_i,
+                    "t": int(t),
+                    "goal_mse_x0": goal_mse,
+                    "fem_proxy": fem_proxy,
+                },
+            )
+
+
+def run_guided_sampling(cfg: GuidedRunConfig) -> None:
+    try:
+        from diffusers import DDPMScheduler
+    except ImportError as e:
+        raise ImportError(
+            "Inference requires optional deps: pip install 'iass-fem-diff[train]' diffusers accelerate"
+        ) from e
+
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise ImportError("Pillow is required to save images. Install with: pip install 'iass-fem-diff[train]'") from e
+
+    ckpt = torch.load(cfg.checkpoint_path, map_location="cpu")
+    train_T = int(ckpt.get("num_train_timesteps", 1000))
+    plane = float(ckpt.get("plane_size", 2.0))
+    phys_scale = float(ckpt.get("vertex_rgb_phys_scale", FIXED_PHYS_EXTENT))
+
+    scheduler = DDPMScheduler(num_train_timesteps=train_T)
+    steps = int(cfg.steps) if cfg.steps is not None else train_T
+    scheduler.set_timesteps(steps, device="cpu")
+    strength = float(cfg.strength)
+    strength = 0.0 if not np.isfinite(strength) else max(0.0, min(1.0, strength))
+    start_idx = int(round(strength * (len(scheduler.timesteps) - 1)))
+    start_t = int(scheduler.timesteps[start_idx])
+
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
-    # Save run config for transparency.
     run_json = {
         "checkpoint": str(cfg.checkpoint_path),
         "steps": steps,
@@ -182,7 +263,7 @@ def run_guided_sampling(cfg: GuidedRunConfig) -> None:
         "goal_image": str(cfg.goal_image) if cfg.goal_image else None,
         "strength": strength,
         "goal_mix": float(cfg.goal_mix),
-        "start_timestep": int(start_t),
+        "start_timestep": start_t,
         "encoding": {"fixed_linear_range": [FIXED_PHYS_MIN, FIXED_PHYS_MAX], "phys_scale": phys_scale},
         "notes": [
             "Sampling saves intermediate decoded RGB displacements to make the denoising trajectory interpretable.",
@@ -192,11 +273,6 @@ def run_guided_sampling(cfg: GuidedRunConfig) -> None:
     (cfg.out_dir / "run.json").write_text(json.dumps(run_json, indent=2), encoding="utf-8")
 
     metrics: list[dict] = []
-    hx = plane / 79.0
-    hy = plane / 79.0
-
-    goal_mix = float(cfg.goal_mix)
-    goal_mix = 0.0 if not np.isfinite(goal_mix) else max(0.0, min(1.0, goal_mix))
 
     def _should_save(step_i: int, t_int: int) -> bool:
         if cfg.save_first_last and (step_i == 0 or t_int == 0):
@@ -205,51 +281,23 @@ def run_guided_sampling(cfg: GuidedRunConfig) -> None:
             return (step_i % int(cfg.save_every)) == 0
         return False
 
-    # Iterate only from start_idx down to the end.
-    timesteps = list(scheduler.timesteps[start_idx:])
-    with torch.no_grad():
-        for step_i, t in enumerate(timesteps):
-            out = model(x, t)
-            eps = out.sample if hasattr(out, "sample") else out[0]
-
-            # Goal steering via eps_goal mixing.
-            goal_mse = 0.0
-            if x0_goal is not None and goal_mix > 0:
-                a_bar = scheduler.alphas_cumprod[t].to(dev)  # scalar
-                sqrt_a = torch.sqrt(a_bar.clamp(min=1e-12))
-                sqrt_oma = torch.sqrt((1.0 - a_bar).clamp(min=1e-12))
-                x0g = torch.zeros_like(x)
-                x0g[:, :3] = x0_goal
-                eps_goal = (x - sqrt_a * x0g) / sqrt_oma
-                eps = (1.0 - goal_mix) * eps + goal_mix * eps_goal
-
-                # Diagnostic: current predicted x0 mse vs goal.
-                x0_hat = (x - sqrt_oma * eps) / sqrt_a
-                goal_mse = float(torch.mean((x0_hat[:, :3] - x0_goal) ** 2).detach().cpu().item())
-
-            x = scheduler.step(eps, t, x).prev_sample
-
-            # Proxy metric on current decoded displacement (cheap).
-            disp = x[:, :3].detach().clamp(-1.0, 1.0) * phys_scale
-            fem_proxy = float(
-                structural_efficiency_loss(disp, hx=hx, hy=hy, span=span).detach().cpu().item()
+    last_rgb: np.ndarray | None = None
+    for gstep in iter_guided_denoise(cfg):
+        metrics.append(gstep.metrics)
+        last_rgb = gstep.rgb_hwc_u8
+        if _should_save(gstep.step_i, gstep.t):
+            Image.fromarray(gstep.rgb_hwc_u8, mode="RGB").save(
+                cfg.out_dir / f"step_{gstep.step_i:04d}_t{gstep.t:04d}.png"
             )
-            metrics.append({"step": step_i, "t": int(t), "goal_mse_x0": goal_mse, "fem_proxy": fem_proxy})
 
-            if _should_save(step_i, int(t)):
-                rgb = _to_uint8_rgb_fixed_linear(x[:, :3], phys_scale)[0]
-                Image.fromarray(rgb, mode="RGB").save(cfg.out_dir / f"step_{step_i:04d}_t{int(t):04d}.png")
+    if last_rgb is None:
+        return
 
-    # Final save
-    final_rgb = _to_uint8_rgb_fixed_linear(x[:, :3], phys_scale)[0]
-    Image.fromarray(final_rgb, mode="RGB").save(cfg.out_dir / "final.png")
+    Image.fromarray(last_rgb, mode="RGB").save(cfg.out_dir / "final.png")
 
-    # Final reference FEM fields (slower, but just once).
     ref_cfg = ReferenceFEMConfig(plane_size=plane, gravity_total=1.0)
-    disp_final = x[:, :3].detach().clamp(-1.0, 1.0) * phys_scale
-    ref = solve_reference_fem_on_displacement_grid(
-        disp_final[0].permute(1, 2, 0).contiguous().cpu().numpy(), cfg=ref_cfg
-    )
+    disp_final = FIXED_PHYS_MIN + (last_rgb.astype(np.float64) / 255.0) * (FIXED_PHYS_MAX - FIXED_PHYS_MIN)
+    ref = solve_reference_fem_on_displacement_grid(disp_final, cfg=ref_cfg)
     if ref.get("valid", False):
         (cfg.out_dir / "final_fem.json").write_text(
             json.dumps(

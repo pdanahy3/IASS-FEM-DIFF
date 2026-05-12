@@ -1,12 +1,15 @@
 """
 DDPM training on trig displacement RGB with an auxiliary FEM proxy loss on the predicted
-clean image x0: steers samples toward lower bending (four-edge sag, Laplacian proxy) while
-the primary MSE on noise keeps the distribution aligned with training rasters.
+clean image x0: four-edge Coons-relative sag and a discrete Laplacian on the vertical
+component. By default the proxy is minimized (smoother sag). With fem.maximize_laplacian_proxy
+(or CLI --fem-ridge), the same scalar is subtracted from the loss so optimization tends to
+increase mean squared Laplacian (ridge-seeking bias on this proxy — not full shell FE).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -35,7 +38,11 @@ def _collate_batch(samples: list[dict]) -> dict[str, torch.Tensor | list]:
     return out
 
 
-def train_from_config(config_path: Path) -> None:
+def train_from_config(
+    config_path: Path,
+    *,
+    maximize_laplacian_proxy: Optional[bool] = None,
+) -> None:
     try:
         from diffusers import DDPMScheduler, UNet2DModel
     except ImportError as e:
@@ -68,10 +75,19 @@ def train_from_config(config_path: Path) -> None:
     plane = float(fem_cfg.get("plane_size", 2.0))
     fem_span = int(fem_cfg.get("curvature_span", 1))
     vert_ch = int(fem_cfg.get("vertical_channel", 2))
+    if maximize_laplacian_proxy is None:
+        maximize_laplacian_proxy = bool(fem_cfg.get("maximize_laplacian_proxy", False))
+    fem_sign = -1.0 if maximize_laplacian_proxy else 1.0
 
     phys_scale = 15.0 if disp_cfg.normalization == "fixed_linear" else 1.0
 
     torch.manual_seed(seed)
+
+    if fem_weight > 0.0:
+        _mode = "ridge-seeking (min loss_noise - lambda*mean(Delta w*)^2)" if maximize_laplacian_proxy else "smooth (min loss_noise + lambda*mean(Delta w*)^2)"
+        print(f"FEM proxy: {_mode}  lambda={fem_weight}")
+    else:
+        print("FEM proxy weight is 0 — auxiliary sag/Laplacian term disabled.")
 
     dev_pref = str(train_cfg.get("device", "auto")).strip().lower()
     if dev_pref == "cuda":
@@ -189,7 +205,7 @@ def train_from_config(config_path: Path) -> None:
                     span=fem_span,
                 )
 
-            loss = loss_noise + fem_weight * loss_fem
+            loss = loss_noise + fem_sign * fem_weight * loss_fem
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -204,9 +220,10 @@ def train_from_config(config_path: Path) -> None:
         avg = epoch_loss / max(n_batches, 1)
         avg_n = epoch_noise / max(n_batches, 1)
         avg_f = epoch_fem / max(n_batches, 1)
+        mode = "ridge(max_Lapl)" if maximize_laplacian_proxy else "smooth(min_Lapl)"
         print(
-            f"epoch {epoch + 1}/{num_epochs}  loss={avg:.5f}  noise={avg_n:.5f}  fem={avg_f:.5f}  "
-            f"fem_w={fem_weight}"
+            f"epoch {epoch + 1}/{num_epochs}  loss={avg:.5f}  noise={avg_n:.5f}  fem_proxy={avg_f:.5f}  "
+            f"fem_w={fem_weight}  fem_proxy_mode={mode}"
         )
 
         ckpt_path = ckpt_dir / f"unet_epoch_{epoch + 1:04d}.pt"
@@ -223,6 +240,7 @@ def train_from_config(config_path: Path) -> None:
                 "curvature_span": fem_span,
                 "vertex_rgb_phys_scale": phys_scale,
                 "vertex_rgb_normalization": disp_cfg.normalization,
+                "fem_maximize_laplacian_proxy": maximize_laplacian_proxy,
             },
             ckpt_path,
         )

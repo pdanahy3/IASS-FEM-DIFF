@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Multi-agent diffusion mesh (80×80)</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; overflow: hidden; font-family: system-ui, sans-serif; background: #111; }
+    #panel {
+      position: fixed; top: 10px; left: 10px; z-index: 20;
+      background: rgba(35, 35, 42, 0.96); color: #e8e8ec;
+      padding: 14px 16px; border-radius: 10px; max-width: 420px;
+      font-size: 13px; box-shadow: 0 4px 24px rgba(0,0,0,0.45);
+      max-height: calc(100vh - 24px); overflow-y: auto;
+    }
+    #panel h1 { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
+    #panel h2 { margin: 14px 0 6px; font-size: 12px; font-weight: 600; color: #a0a8c0; text-transform: uppercase; letter-spacing: 0.04em; }
+    #panel label { display: block; margin-top: 8px; cursor: pointer; }
+    #panel .hint { font-size: 11px; color: #9898a4; line-height: 1.4; margin-top: 6px; }
+    #panel input[type="text"], #panel input[type="number"], #panel select {
+      width: 100%; margin-top: 4px; padding: 6px 8px; border-radius: 6px;
+      border: 1px solid #555; background: #1e1e24; color: #fff; font-size: 12px;
+    }
+    #panel input[type="range"] { width: 100%; margin-top: 4px; }
+    #panel .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    #panel button {
+      margin-top: 10px; padding: 8px 12px; border: none; border-radius: 6px;
+      background: #3d6ad6; color: #fff; font-size: 12px; cursor: pointer; font-weight: 500;
+    }
+    #panel button.secondary { background: #444a58; }
+    #panel button:hover { filter: brightness(1.08); }
+    #status { margin-top: 10px; font-size: 11px; line-height: 1.45; color: #b0b0b8; white-space: pre-wrap; }
+    #hint {
+      position: fixed; left: 10px; bottom: 10px; z-index: 10;
+      color: #888; font-size: 11px; background: rgba(0,0,0,0.45);
+      padding: 8px 10px; border-radius: 6px; max-width: min(520px, 92vw); pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="panel">
+    <h1>Multi-agent mesh + diffusion steering</h1>
+    <p class="hint">6400 agents on an 80×80 grid. RGB from each DDPM step decodes to a displacement vector per vertex (fixed-linear [−15,15] per channel, same as training). Cohesion, separation, and alignment are local 8-neighbor boids; diffusion pulls each agent toward the decoded surface target.</p>
+
+    <h2>Behaviors</h2>
+    <label>Cohesion <span id="cohesionVal"></span><input type="range" id="cohesion" min="0" max="4" step="0.05" value="0.85" /></label>
+    <label>Separation <span id="separationVal"></span><input type="range" id="separation" min="0" max="8" step="0.05" value="2.6" /></label>
+    <label>Alignment <span id="alignmentVal"></span><input type="range" id="alignment" min="0" max="4" step="0.05" value="0.65" /></label>
+    <label>Diffusion steering <span id="diffusionVal"></span><input type="range" id="diffusion" min="0" max="6" step="0.05" value="1.25" /></label>
+    <label>Plane size <span id="planeSizeVal"></span><input type="range" id="planeSize" min="0.5" max="4" step="0.05" value="2" /></label>
+    <label>Displacement scale <span id="dispScaleVal"></span><input type="range" id="dispScale" min="0.1" max="2.5" step="0.05" value="1" /></label>
+    <label>Max speed <span id="maxSpeedVal"></span><input type="range" id="maxSpeed" min="0.2" max="6" step="0.05" value="1.8" /></label>
+    <label>Separation radius <span id="sepRadiusVal"></span><input type="range" id="sepRadius" min="0.02" max="0.35" step="0.01" value="0.12" /></label>
+
+    <h2>Offline guide (no checkpoint)</h2>
+    <label>Guide / seed image (any size; resampled to 80×80)
+      <input type="file" id="guideFile" accept="image/*" />
+    </label>
+    <div class="row">
+      <button type="button" class="secondary" id="btnOfflineGuide">Apply image as steering field</button>
+      <label style="margin-top:12px;display:flex;align-items:center;gap:8px"><input type="checkbox" id="offlineMode" /> Hold field (ignore new server steps)</label>
+    </div>
+
+    <h2>Server inference (PyTorch checkpoint)</h2>
+    <p class="hint">From repo root: <code>python scripts/diffusion_mesh_infer_server.py</code> then start below. Checkpoint path is resolved on the <strong>server</strong> (relative to repo root).</p>
+    <label>Server URL
+      <input type="text" id="serverUrl" value="http://127.0.0.1:8765" />
+    </label>
+    <label>Checkpoint path
+      <input type="text" id="checkpointPath" placeholder="outputs/checkpoints/.../unet_epoch_020.pt" />
+    </label>
+    <div class="row">
+      <label style="flex:1">Seed <input type="number" id="inferSeed" value="42" /></label>
+      <label style="flex:1">Steps <input type="number" id="inferSteps" value="200" min="1" /></label>
+    </div>
+    <div class="row">
+      <label style="flex:1">Strength <input type="number" id="inferStrength" value="0.35" step="0.05" min="0" max="1" /></label>
+      <label style="flex:1">Goal mix <input type="number" id="inferGoalMix" value="0" step="0.05" min="0" max="1" /></label>
+    </div>
+    <label>Device
+      <select id="inferDevice">
+        <option value="cuda">cuda</option>
+        <option value="cpu">cpu</option>
+      </select>
+    </label>
+    <label>Optional seed image (img2img)
+      <input type="file" id="seedFile" accept="image/*" />
+    </label>
+    <label>Optional goal image (steering)
+      <input type="file" id="goalFile" accept="image/*" />
+    </label>
+    <div class="row">
+      <button type="button" id="btnStartServer">Start diffusion stream</button>
+      <button type="button" class="secondary" id="btnStop">Stop poll</button>
+      <button type="button" class="secondary" id="btnReset">Reset mesh</button>
+    </div>
+
+    <div id="status">Serve this folder (e.g. <code>npx serve .</code> from repo root) and open this page over HTTP. Or load offline guide only.</div>
+  </div>
+  <div id="hint">Orbit · left drag · Zoom · scroll · Pan · right drag · three r0.160</div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="./multi-agent-diffusion-mesh.js"></script>
+  <script type="module">
+    function bindSlider(id, fmt = (x) => x) {
+      const el = document.getElementById(id);
+      const out = document.getElementById(id + 'Val');
+      const sync = () => { if (out) out.textContent = fmt(parseFloat(el.value)); };
+      el.addEventListener('input', sync);
+      sync();
+    }
+    bindSlider('cohesion', (x) => x.toFixed(2));
+    bindSlider('separation', (x) => x.toFixed(2));
+    bindSlider('alignment', (x) => x.toFixed(2));
+    bindSlider('diffusion', (x) => x.toFixed(2));
+    bindSlider('planeSize', (x) => x.toFixed(2));
+    bindSlider('dispScale', (x) => x.toFixed(2));
+    bindSlider('maxSpeed', (x) => x.toFixed(2));
+    bindSlider('sepRadius', (x) => x.toFixed(2));
+  </script>
+</body>
+</html>
